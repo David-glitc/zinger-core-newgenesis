@@ -34,6 +34,12 @@ export const CANARY_LIMITS: ExecLimits = {
   driftGraceMs: 120_000,
 };
 
+/** $200 canary: reward minimums of 50 shares fit at any price inside a $50 market cap. */
+export const BUDGET_200_LIMITS: ExecLimits = {
+  ...CANARY_LIMITS, maxOrderShares: 100, maxNetSharesPerToken: 200, maxMarketUsd: 50, maxPortfolioUsd: 200, maxLossUsd: 20,
+};
+export const LIMIT_PROFILES: Record<string, ExecLimits> = { '100': CANARY_LIMITS, '200': BUDGET_200_LIMITS };
+
 export type OrderState = 'submitting' | 'open' | 'cancel_pending' | 'unknown' | 'filled' | 'cancelled' | 'rejected';
 const LIVE: OrderState[] = ['submitting', 'open', 'cancel_pending', 'unknown'];
 export interface TrackedOrder {

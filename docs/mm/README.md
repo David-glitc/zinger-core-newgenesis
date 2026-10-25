@@ -54,7 +54,7 @@ Real capital stays conditional on a positive multi-day out-of-sample portfolio r
 | Dry-run venue | `venue.ts` | In-memory exchange. Resting orders fill only when the public book trades through them |
 | CLOB adapter | `clobVenue.ts` | `@polymarket/clob-client-v2`: GTC post-only orders, batch cancel, cancel-all, open orders, order status, server heartbeat (the exchange cancels our orders if heartbeats stop), conditional token balances. SDK error objects count as failures, never as acks |
 | User channel | `userChannel.ts` | Our trade events from the user WebSocket. MATCHED/MINED/CONFIRMED count once; FAILED reverses. Missed messages are recovered by reconciliation |
-| Arming gate | `gate.ts` | All checks must pass: `ZINGER_MM_LIVE=1`; `ZINGER_MM_LIVE_ACK` set to the hash of the exact limits; limits within the canary ceiling ($100 portfolio, $25/market, 50 shares/order, $10 loss); no kill file; no proxy; region allowed from the real egress; collateral covers the cap; ≥3 positive out-of-sample days with a positive portfolio result |
+| Arming gate | `gate.ts` | All checks must pass: `ZINGER_MM_LIVE=1`; `ZINGER_MM_LIVE_ACK` set to the hash of the exact limits; limits within the canary ceiling ($200 portfolio, $50/market, 100 shares/order, $20 loss; `--budget=100|200` picks the profile); no kill file; no proxy; region allowed from the real egress; collateral covers the cap; ≥3 positive out-of-sample days with a positive portfolio result |
 | Runner | `scripts/mm-live.ts` | `preflight` (read-only; `--auth` adds balance, open orders and holdings) and `run` (dry-run by default) |
 
 ```bash

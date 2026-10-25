@@ -12,20 +12,22 @@
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { planMmQuote, DEFAULT_MM_CONFIG, type MmConfig, type MidObservation } from '../src/research/mm/strategy.js';
-import { CANARY_LIMITS, MmLiveExecutor, type DesiredQuote, type ExecLimits, type JournalRow } from '../src/research/mm/live/executor.js';
+import { LIMIT_PROFILES, MmLiveExecutor, type DesiredQuote, type ExecLimits, type JournalRow } from '../src/research/mm/live/executor.js';
 import { DryRunVenue, type MmVenue, type TickSize } from '../src/research/mm/live/venue.js';
+import { markouts, midAfter, rewardShare, type FillMark } from '../src/research/mm/live/evaluation.js';
 import { checkGeoblock, evaluateGate, killSwitch, limitsHash, readEvidence } from '../src/research/mm/live/gate.js';
 
 const [cmd = 'run', ...rest] = process.argv.slice(2);
 const args = Object.fromEntries(rest.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : 'true']; }));
-const allowed = ['markets', 'universe', 'mode', 'minutes', 'out', 'auth', 'evidence', 'kill-file', 'offset-ticks', 'max-markets'];
+const allowed = ['markets', 'universe', 'mode', 'minutes', 'out', 'auth', 'evidence', 'kill-file', 'offset-ticks', 'max-markets', 'budget'];
 if (!['preflight', 'run'].includes(cmd) || Object.keys(args).some((k) => !allowed.includes(k))) {
   console.error(`usage: mm-live.ts preflight|run --markets=<ids> [--${allowed.slice(1).join(' --')}]`); process.exit(2);
 }
 const mode = (args.mode ?? 'dry-run') as 'dry-run' | 'live';
 if (!['dry-run', 'live'].includes(mode)) throw Error('mode must be dry-run or live');
 const killFile = args['kill-file'] ?? 'tmp/mm-live.KILL';
-const limits: ExecLimits = { ...CANARY_LIMITS };
+if (!LIMIT_PROFILES[args.budget ?? '100']) throw Error(`--budget must be one of ${Object.keys(LIMIT_PROFILES).join(', ')}`);
+const limits: ExecLimits = { ...LIMIT_PROFILES[args.budget ?? '100'] };
 const offsetTicks = Number(args['offset-ticks'] ?? 1);
 const CLOB = 'https://clob.polymarket.com';
 
@@ -35,7 +37,7 @@ async function get(url: string, init?: RequestInit) {
   return r.json() as Promise<any>;
 }
 
-interface Market { conditionId: string; question: string; event: string; yes: string; no: string; tick: number; tickSize: TickSize; minShares: number; negRisk: boolean; fee: { rate: number; exponent: number }; endAt: number; rewardMinSize: number; rewardMaxSpread: number }
+interface Market { conditionId: string; question: string; event: string; yes: string; no: string; tick: number; tickSize: TickSize; minShares: number; negRisk: boolean; fee: { rate: number; exponent: number }; endAt: number; rewardMinSize: number; rewardMaxSpread: number; dailyPool: number }
 
 async function loadMarkets(): Promise<Market[]> {
   let ids = (args.markets ?? '').split(',').filter(Boolean);
@@ -52,7 +54,8 @@ async function loadMarkets(): Promise<Market[]> {
     const tick = Number(d.mts);
     out.push({ conditionId: id, question: m.question ?? '', event: m.market_slug ?? id, yes: tokens[0], no: tokens[1], tick, tickSize: String(tick) as TickSize,
       minShares: Number(d.mos), negRisk: d.nr === true, fee, endAt: Date.parse(m.end_date_iso ?? d.gst ?? ''),
-      rewardMinSize: Number(m.rewards?.min_size ?? 0), rewardMaxSpread: Number(m.rewards?.max_spread ?? 0) });
+      rewardMinSize: Number(m.rewards?.min_size ?? 0), rewardMaxSpread: Number(m.rewards?.max_spread ?? 0),
+      dailyPool: (m.rewards?.rates ?? []).reduce((s: number, r: any) => s + Number(r.rewards_daily_rate ?? 0), 0) });
   }
   return out;
 }
@@ -104,6 +107,8 @@ async function run(markets: Market[]) {
   const journal = (r: JournalRow) => appendFileSync(journalPath, JSON.stringify(r) + '\n');
   const kill = killSwitch(killFile);
 
+  const fills: FillMark[] = [];
+  const series = new Map<string, { at: number; mid: number }[]>();
   let venue: MmVenue, dry: DryRunVenue | null = null, channel: { stop(): void } | null = null;
   let ex: MmLiveExecutor;
   const quotedTokens = markets.flatMap((m) => [m.yes, m.no]);
@@ -124,7 +129,7 @@ async function run(markets: Market[]) {
     dry = new DryRunVenue();
     venue = dry;
     ex = new MmLiveExecutor(venue, limits, journal, Date.now, kill);
-    dry.onFill = (f) => { void ex.onFill(f); };
+    dry.onFill = (f) => { fills.push({ side: f.side, price: f.price, shares: f.shares, at: f.at, token: f.tokenId }); void ex.onFill(f); };
   }
   writeFileSync(join(out, 'config.json'), JSON.stringify({ mode, limits, limitsHash: limitsHash(limits), offsetTicks, markets }, null, 1));
 
@@ -132,6 +137,7 @@ async function run(markets: Market[]) {
     maxNetShares: limits.maxNetSharesPerToken, maxMarketUsd: limits.maxMarketUsd, maxEventUsd: limits.maxMarketUsd, maxPortfolioUsd: limits.maxPortfolioUsd };
   const history = new Map<string, MidObservation[]>();
   const marks = new Map<string, number>();
+  const reward = new Map<string, { usd: number; quotedMs: number; eligibleMs: number }>();
   const stats = { cycles: 0, bookErrors: 0, placed: 0, cancelled: 0, reasons: {} as Record<string, number> };
   const endAt = Date.now() + Number(args.minutes ?? 10) * 60_000;
   let lastReconcile = 0, lastHeartbeat = 0;
@@ -148,6 +154,17 @@ async function run(markets: Market[]) {
         if (!b?.bids.length || !b.asks.length) { marks.delete(token); continue; }
         const mid = (Math.max(...b.bids.map((l) => l.price)) + Math.min(...b.asks.map((l) => l.price))) / 2;
         marks.set(token, mid);
+        if (!series.has(token)) series.set(token, []);
+        series.get(token)!.push({ at: b.receivedAt, mid });
+        if (token === m.yes) {
+          const r = reward.get(m.conditionId) ?? { usd: 0, quotedMs: 0, eligibleMs: 0 };
+          for (const o of ex.liveOrders().filter((x) => x.tokenId === token && x.state === 'open')) {
+            const share = rewardShare({ side: o.side, price: o.price, shares: o.shares - o.filled }, b, m.rewardMaxSpread, m.rewardMinSize);
+            r.quotedMs += 1000; if (share > 0) r.eligibleMs += 1000;
+            r.usd += share * m.dailyPool / 86_400;
+          }
+          reward.set(m.conditionId, r);
+        }
         const h = (history.get(token) ?? []).filter((p) => p.at > t0 - 60_000); h.push({ at: b.receivedAt, mid }); history.set(token, h);
         dry?.touch(token, Math.max(...b.bids.map((l) => l.price)), Math.min(...b.asks.map((l) => l.price)));
         if (token !== m.yes) continue; // one outcome per market; the NO side is the mirror book
@@ -170,7 +187,11 @@ async function run(markets: Market[]) {
 
   const clean = await ex.shutdown(ex.halted ?? 'run_complete');
   channel?.stop();
-  const summary = { mode, halted: ex.halted, cleanShutdown: clean, ...stats, positions: Object.fromEntries(ex.position), cash: round(ex.cash),
+  const elapsedDays = Math.max(1e-9, stats.cycles / 86_400);
+  const rewardRows = markets.map((m) => { const r = reward.get(m.conditionId) ?? { usd: 0, quotedMs: 0, eligibleMs: 0 }; return { market: m.question.slice(0, 60), dailyPool: m.dailyPool, rewardMinSize: m.rewardMinSize, quotedPct: round(r.quotedMs / 10 / Math.max(1, stats.cycles)), eligiblePct: round(r.eligibleMs / 10 / Math.max(1, stats.cycles)), estRewardUsd: round(r.usd), estRewardUsdPerDay: round(r.usd / elapsedDays) }; });
+  const evaluation = { fills: fills.length, filledShares: round(fills.reduce((s, f) => s + f.shares, 0)), markouts: markouts(fills, (t, at) => midAfter(series.get(t) ?? [], at)),
+    estRewardUsdPerDay: round(rewardRows.reduce((s, r) => s + r.estRewardUsdPerDay, 0)), rewardByMarket: rewardRows };
+  const summary = { mode, budget: args.budget ?? '100', halted: ex.halted, cleanShutdown: clean, ...stats, evaluation, positions: Object.fromEntries(ex.position), cash: round(ex.cash),
     equityUsd: round(ex.equity(marks) ?? NaN), orders: [...ex.orders.values()].reduce((s, o) => ({ ...s, [o.state]: (s[o.state] ?? 0) + 1 }), {} as Record<string, number>) };
   writeFileSync(join(out, 'summary.json'), JSON.stringify(summary, null, 1));
   console.log(JSON.stringify(summary, null, 1));

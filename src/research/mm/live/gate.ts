@@ -7,7 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import type { ExecLimits } from './executor.js';
 
 /** Hard ceiling for a first funded canary. Raising it is a code change, reviewed like one. */
-export const CANARY_CEILING = { maxPortfolioUsd: 100, maxMarketUsd: 25, maxOrderShares: 50, maxLossUsd: 10, maxOpenOrders: 20 };
+export const CANARY_CEILING = { maxPortfolioUsd: 200, maxMarketUsd: 50, maxOrderShares: 100, maxLossUsd: 20, maxOpenOrders: 20 };
 export const MIN_POSITIVE_OOS_DAYS = 3;
 
 export interface Geoblock { checked: boolean; blocked: boolean; country?: string; viaProxy: boolean; error?: string }
