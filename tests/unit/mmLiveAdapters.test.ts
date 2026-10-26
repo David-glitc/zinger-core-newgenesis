@@ -11,9 +11,9 @@ function fake(over: Partial<ClobLike> = {}) {
     cancelOrders: async (ids) => { calls.push(['cancel', ids]); return { canceled: ids.slice(0, 1), not_canceled: {} }; },
     cancelAll: async () => ({ canceled: [] }),
     getOpenOrders: async () => [{ id: '0xabc', asset_id: 'T', side: 'BUY', price: '0.4', original_size: '10', size_matched: '3', status: 'LIVE' }],
-    getOrder: async () => ({ id: '0xabc', asset_id: 'T', side: 'BUY', price: '0.4', original_size: '10', size_matched: '10', status: 'MATCHED' }),
+    getOrder: async (id) => { calls.push(['getOrder', id]); return id === '0xabc' ? { id: '0xabc', asset_id: 'T', side: 'BUY', price: '0.4', original_size: '10', size_matched: '4', status: 'MATCHED' } : { error: 'not found', status: 404 }; },
     postHeartbeat: async (id) => ({ heartbeat_id: `${id}x` }),
-    getBalanceAllowance: async () => ({ balance: '3000000' }),
+    getBalanceAllowance: async (p) => { calls.push(['balance', p]); return p.asset_type === 'CONDITIONAL' && p.token_id === 'T' ? { balance: '3000000' } : { error: 'bad params' }; },
     ...over,
   };
   return { c, calls };
@@ -38,11 +38,16 @@ describe('CLOB venue adapter', () => {
   });
 
   it('splits partial cancels and maps orders, balances and heartbeats', async () => {
-    const v = new ClobVenue(fake().c, enums, () => ['T']);
+    const { c, calls } = fake();
+    const v = new ClobVenue(c, enums, () => ['T']);
     expect(await v.cancel(['a', 'b'])).toEqual({ cancelled: ['a'], failed: ['b'] });
     expect((await v.openOrders())[0]).toMatchObject({ id: '0xabc', matchedShares: 3, status: 'open' });
     expect((await v.getOrder('0xabc'))!.status).toBe('filled');
     expect((await v.positions()).get('T')).toBe(3);
+    expect(calls).toContainEqual(['getOrder', '0xabc']);
+    expect(calls).toContainEqual(['balance', { asset_type: 'CONDITIONAL', token_id: 'T' }]);
+    await expect(v.getOrder('0xother')).rejects.toThrow(/get_order_failed/);
+    expect(mapOrderStatus('MATCHED', 0, 10)).toBe('filled');
     expect(await v.heartbeat()).toBe(true);
     expect(mapOrderStatus('CANCELED_MARKET_RESOLVED', 0, 10)).toBe('cancelled');
     expect(mapOrderStatus('SOMETHING_NEW', 0, 10)).toBe('unknown');
@@ -54,6 +59,28 @@ describe('CLOB venue adapter', () => {
     const ex = new MmLiveExecutor(v, CANARY_LIMITS);
     await ex.heartbeat(); await ex.heartbeat();
     expect(ex.halted).toBe('heartbeat_missed');
+  });
+});
+
+describe('review fixes: adapter', () => {
+  it('cancel-all rejection shapes throw', async () => {
+    await expect(new ClobVenue(fake({ cancelAll: async () => ({ success: false, errorMsg: 'rate limited' }) }).c, enums, () => []).cancelAll()).rejects.toThrow(/rate limited/);
+  });
+  it('malformed balances throw instead of reading as NaN or zero', async () => {
+    await expect(new ClobVenue(fake({ getBalanceAllowance: async () => ({ balance: 'abc' }) }).c, enums, () => ['T']).positions()).rejects.toThrow(/balance_invalid/);
+    await expect(new ClobVenue(fake({ getBalanceAllowance: async () => ({}) }).c, enums, () => ['T']).positions()).rejects.toThrow(/balance_invalid/);
+  });
+  it('a failed order lookup keeps the order and halts after three unconfirmed checks', async () => {
+    const { DryRunVenue } = await import('../../src/research/mm/live/venue.js');
+    const venue = new DryRunVenue();
+    const ex = new MmLiveExecutor(venue, CANARY_LIMITS);
+    await ex.step([{ tokenId: 'T', conditionId: 'C', event: 'E', side: 'BUY', price: 0.4, shares: 10, tick: 0.01, tickSize: '0.01', negRisk: false }], new Map([['T', 0.4]]));
+    venue.openOrders = async () => [];
+    venue.getOrder = async () => { throw new Error('timeout'); };
+    await ex.reconcile();
+    expect(ex.liveOrders()).toHaveLength(1);
+    await ex.reconcile(); await ex.reconcile();
+    expect(ex.halted).toMatch(/^order_state_unconfirmed/);
   });
 });
 

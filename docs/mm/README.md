@@ -62,6 +62,18 @@ npx tsx scripts/mm-live.ts preflight --markets=<conditionId,...>
 npx tsx scripts/mm-live.ts run --markets=<conditionId,...> --minutes=10
 ```
 
+Safety behaviour added after review (NewGenesis04/zinger-core#2):
+- Every exit path cancels and then checks that nothing rests, including thrown errors.
+- A halt that lands mid-cycle stops further submits.
+- Reconciliation and heartbeats keep running while public books are down, and quotes are pulled after 30 s without books.
+- An order is closed only on a terminal venue status. Three failed lookups halt.
+- A failed trade reverses quantity already taken from reconciliation.
+- There is a per-event cap.
+- A lock file (`tmp/mm-live.<mode>.lock`) allows one runner at a time. It is kept if shutdown is not confirmed clean.
+- A loss ledger (`tmp/mm-live/loss-ledger-<mode>.json`) makes earlier sessions count against the loss limit.
+- The gate also rejects a non-default `CLOB_API_URL` and every write relay variable.
+- Malformed balances fail preflight and reconciliation instead of reading as zero.
+
 Live mode also needs a dedicated wallet with no open orders and no holdings in the quoted tokens. Any order the executor did not place is treated as an orphan: it is cancelled and the executor halts. To stop, press Ctrl-C, send SIGTERM or create `tmp/mm-live.KILL`. Every stop cancels all orders and then checks that none rest.
 
 First dry run (2026-10-23, 5 House-seat markets, 3 minutes, 1 tick behind the touch): 3 quotes placed and held with no churn, and a clean shutdown. The other two markets were held back because their 50-share reward minimum costs more than the $25 per-market cap.

@@ -25,6 +25,7 @@ export interface ClobEnums { buy: any; sell: any; gtc: any; conditional: any }
 const errorOf = (r: any): string | null => {
   if (r == null) return 'empty_response';
   if (typeof r === 'object' && 'error' in r && r.error) return typeof r.error === 'string' ? r.error : JSON.stringify(r.error);
+  if (typeof r === 'object' && (r.success === false || (typeof r.errorMsg === 'string' && r.errorMsg))) return r.errorMsg || 'success_false';
   return null;
 };
 
@@ -60,7 +61,7 @@ export class ClobVenue implements MmVenue {
       this.enums.gtc,
       true,
     );
-    const err = errorOf(res) ?? (res.success === false ? res.errorMsg || 'rejected' : null);
+    const err = errorOf(res);
     if (err) return { ok: false, error: err };
     if (!res.orderID) return { ok: false, error: 'no_order_id' };
     // A post-only order that matched on arrival would be a venue bug; surface it to reconciliation.
@@ -92,7 +93,11 @@ export class ClobVenue implements MmVenue {
 
   async getOrder(id: string) {
     const res = await this.client.getOrder(id);
-    if (errorOf(res) || !res?.id) return null;
+    const err = errorOf(res);
+    // A failed lookup throws so the executor keeps the order; null only means the venue returned no order.
+    if (err && err !== 'empty_response') throw new Error(`get_order_failed:${id}: ${err}`);
+    if (!res?.id) return null;
+    if (String(res.id) !== id) throw new Error(`get_order_mismatch:${id}`);
     return toVenueOrder(res);
   }
 
@@ -112,7 +117,9 @@ export class ClobVenue implements MmVenue {
       const res = await this.client.getBalanceAllowance({ asset_type: this.enums.conditional, token_id: token });
       const err = errorOf(res);
       if (err) throw new Error(`balance_failed:${token}: ${err}`);
-      out.set(token, Number(res.balance ?? 0) / 1e6);
+      const balance = Number(res?.balance);
+      if (res?.balance == null || !Number.isFinite(balance) || balance < 0) throw new Error(`balance_invalid:${token}`);
+      out.set(token, balance / 1e6);
     }
     return out;
   }

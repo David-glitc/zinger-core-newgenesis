@@ -9,7 +9,7 @@
  * has no open orders and holds none of the quoted tokens (a dedicated, flat wallet).
  * Stop: Ctrl-C, SIGTERM or create the kill file. Every path cancels all orders first.
  */
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { planMmQuote, DEFAULT_MM_CONFIG, type MmConfig, type MidObservation } from '../src/research/mm/strategy.js';
 import { LIMIT_PROFILES, MmLiveExecutor, type DesiredQuote, type ExecLimits, type JournalRow } from '../src/research/mm/live/executor.js';
@@ -88,13 +88,16 @@ async function preflight(markets: Market[]) {
     const bal = await trade.getClobBalance();
     collateralUsd = Math.min(bal.balance, bal.allowance);
     const open = await client.getOpenOrders();
-    const held: Record<string, number> = {};
+    const held: Record<string, number | null> = {}, balanceErrors: string[] = [];
+    const conditional = (await import('@polymarket/clob-client-v2')).AssetType.CONDITIONAL;
     for (const m of markets) for (const t of [m.yes, m.no]) {
-      const r = await client.getBalanceAllowance({ asset_type: (await import('@polymarket/clob-client-v2')).AssetType.CONDITIONAL, token_id: t });
-      held[t] = Number(r?.balance ?? 0) / 1e6;
+      const r = await client.getBalanceAllowance({ asset_type: conditional, token_id: t });
+      const v = Number(r?.balance);
+      // A missing or malformed balance is unknown, never zero: the wallet does not count as flat.
+      if (r?.error || r?.balance == null || !Number.isFinite(v) || v < 0) { held[t] = null; balanceErrors.push(t); } else held[t] = v / 1e6;
     }
-    account = { checked: true, collateralUsd, openOrders: Array.isArray(open) ? open.length : null, heldShares: held,
-      flat: Object.values(held).every((v) => v === 0), noOpenOrders: Array.isArray(open) && open.length === 0 };
+    account = { checked: true, collateralUsd, openOrders: Array.isArray(open) ? open.length : null, heldShares: held, balanceErrors,
+      flat: balanceErrors.length === 0 && Object.values(held).every((v) => v === 0), noOpenOrders: Array.isArray(open) && open.length === 0 };
   }
   const gate = evaluateGate({ mode: 'live', limits, env: process.env, geoblock, collateralUsd, evidence: readEvidence(args.evidence), killFile });
   return { limitsHash: limitsHash(limits), limits, gate, account, markets: markets.map((m) => ({ id: m.conditionId, q: m.question, tick: m.tick, minShares: m.minShares, rewardMinSize: m.rewardMinSize, negRisk: m.negRisk })) };
@@ -106,11 +109,28 @@ async function run(markets: Market[]) {
   const journalPath = join(out, 'journal.jsonl');
   const journal = (r: JournalRow) => appendFileSync(journalPath, JSON.stringify(r) + '\n');
   const kill = killSwitch(killFile);
+  // One runner per wallet on this host, held until shutdown has confirmed nothing rests.
+  // Another host on the same wallet is caught by reconciliation (its orders are orphans: halt).
+  const lockPath = `tmp/mm-live.${mode}.lock`;
+  mkdirSync('tmp', { recursive: true });
+  let lockFd: number;
+  try { lockFd = openSync(lockPath, 'wx'); } catch { throw Error(`${lockPath} exists: another ${mode} runner is active, or an earlier one did not confirm a clean shutdown. Check the venue for open orders, then delete it.`); }
+  writeFileSync(lockFd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), out }));
+  // Loss ledger: results of earlier sessions count against the loss limit.
+  const ledgerPath = join('tmp', 'mm-live', `loss-ledger-${mode}.json`);
+  const ledger: { sessions: { endedAt: string; pnlUsd: number; out: string }[] } = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, 'utf8')) : { sessions: [] };
+  const priorPnlUsd = ledger.sessions.reduce((t, x) => t + x.pnlUsd, 0);
+  if (limits.maxLossUsd + priorPnlUsd <= 0) { closeSync(lockFd); unlinkSync(lockPath); throw Error(`loss ledger ${ledgerPath}: earlier sessions lost $${(-priorPnlUsd).toFixed(2)}, the full $${limits.maxLossUsd} limit`); }
 
   const fills: FillMark[] = [];
   const series = new Map<string, { at: number; mid: number }[]>();
   let venue: MmVenue, dry: DryRunVenue | null = null, channel: { stop(): void } | null = null;
-  let ex: MmLiveExecutor;
+  let ex: MmLiveExecutor | null = null;
+  let clean = false, failure: unknown = null;
+  const stats = { cycles: 0, bookErrors: 0, placed: 0, cancelled: 0, reasons: {} as Record<string, number> };
+  const marks = new Map<string, number>();
+  const reward = new Map<string, { usd: number; quotedMs: number; eligibleMs: number }>();
+  try {
   const quotedTokens = markets.flatMap((m) => [m.yes, m.no]);
   if (mode === 'live') {
     const pf = await preflight(markets);
@@ -121,32 +141,48 @@ async function run(markets: Market[]) {
     const { connectUserChannel } = await import('../src/research/mm/live/userChannel.js');
     const WebSocket = (await import('ws')).default;
     venue = new ClobVenue(client, enums, () => quotedTokens, (msg, data) => journal({ at: Date.now(), type: `venue:${msg}`, data }));
-    ex = new MmLiveExecutor(venue, limits, journal, Date.now, kill);
+    const live = new MmLiveExecutor(venue, limits, journal, Date.now, kill);
+    ex = live;
     channel = connectUserChannel({ creds, markets: () => markets.map((m) => m.conditionId), WebSocketImpl: WebSocket as any,
-      ours: (id) => [...ex.orders.values()].some((o) => o.venueOrderId === id),
-      onFill: (f) => { void ex.onFill(f); }, onState: (s, d) => journal({ at: Date.now(), type: `user_channel:${s}`, detail: d }) });
+      ours: (id) => [...live.orders.values()].some((o) => o.venueOrderId === id),
+      onFill: (f) => { void live.onFill(f); }, onState: (s, d) => journal({ at: Date.now(), type: `user_channel:${s}`, detail: d }) });
   } else {
     dry = new DryRunVenue();
     venue = dry;
-    ex = new MmLiveExecutor(venue, limits, journal, Date.now, kill);
-    dry.onFill = (f) => { fills.push({ side: f.side, price: f.price, shares: f.shares, at: f.at, token: f.tokenId }); void ex.onFill(f); };
+    const sim = new MmLiveExecutor(venue, limits, journal, Date.now, kill);
+    ex = sim;
+    dry.onFill = (f) => { fills.push({ side: f.side, price: f.price, shares: f.shares, at: f.at, token: f.tokenId }); void sim.onFill(f); };
   }
+  ex.priorPnlUsd = priorPnlUsd;
   writeFileSync(join(out, 'config.json'), JSON.stringify({ mode, limits, limitsHash: limitsHash(limits), offsetTicks, markets }, null, 1));
 
   const cfg: MmConfig = { ...DEFAULT_MM_CONFIG, maxAgeMs: 5000, maxSpread: 0.2, quoteLifetimeMs: 10_000, feeReserveLegs: 1, quoteOffsetTicks: offsetTicks,
-    maxNetShares: limits.maxNetSharesPerToken, maxMarketUsd: limits.maxMarketUsd, maxEventUsd: limits.maxMarketUsd, maxPortfolioUsd: limits.maxPortfolioUsd };
+    maxNetShares: limits.maxNetSharesPerToken, maxMarketUsd: limits.maxMarketUsd, maxEventUsd: limits.maxEventUsd, maxPortfolioUsd: limits.maxPortfolioUsd };
   const history = new Map<string, MidObservation[]>();
-  const marks = new Map<string, number>();
-  const reward = new Map<string, { usd: number; quotedMs: number; eligibleMs: number }>();
-  const stats = { cycles: 0, bookErrors: 0, placed: 0, cancelled: 0, reasons: {} as Record<string, number> };
   const endAt = Date.now() + Number(args.minutes ?? 10) * 60_000;
-  let lastReconcile = 0, lastHeartbeat = 0;
+  let lastReconcile = 0, lastHeartbeat = 0, bookDownSince: number | null = null;
+  const x = ex;
+  // Reconciliation and heartbeats run every cycle, including cycles without fresh books.
+  const service = async () => {
+    if (Date.now() - lastReconcile > 5000) { await x.reconcile(); lastReconcile = Date.now(); }
+    if (mode === 'live' && Date.now() - lastHeartbeat > 5000) { await x.heartbeat(); lastHeartbeat = Date.now(); }
+  };
   console.log(`mm-live ${mode}: ${markets.length} markets, journal ${journalPath}`);
 
   while (!ex.halted && Date.now() < endAt) {
     const t0 = Date.now();
     let bk: Awaited<ReturnType<typeof books>>;
-    try { bk = await books(quotedTokens); } catch (e) { stats.bookErrors++; journal({ at: t0, type: 'book_error', error: String(e?.message ?? e) }); await sleep(1000); continue; }
+    try { bk = await books(quotedTokens); bookDownSince = null; } catch (e) {
+      stats.bookErrors++; bookDownSince ??= t0;
+      journal({ at: t0, type: 'book_error', error: String(e?.message ?? e), downMs: t0 - bookDownSince });
+      const stop = kill();
+      // Quotes cannot be repriced without books: after 30 s, pull them rather than leave them stale.
+      if (stop) await x.halt(`kill:${stop}`);
+      else if (t0 - bookDownSince > 30_000) await x.halt('book_outage_30s');
+      else await service();
+      await sleep(Math.max(0, 1000 - (Date.now() - t0)));
+      continue;
+    }
     const desired: DesiredQuote[] = [];
     for (const m of markets) {
       for (const token of [m.yes, m.no]) {
@@ -180,13 +216,26 @@ async function run(markets: Market[]) {
     }
     const r = await ex.step(desired, marks);
     stats.placed += r.placed; stats.cancelled += r.cancelled; stats.cycles++;
-    if (Date.now() - lastReconcile > 5000) { await ex.reconcile(); lastReconcile = Date.now(); }
-    if (mode === 'live' && Date.now() - lastHeartbeat > 5000) { await ex.heartbeat(); lastHeartbeat = Date.now(); }
+    await service();
     await sleep(Math.max(0, 1000 - (Date.now() - t0)));
   }
 
-  const clean = await ex.shutdown(ex.halted ?? 'run_complete');
-  channel?.stop();
+  } catch (e) { failure = e; }
+  finally {
+    // Every exit path, including a thrown error, cancels and verifies before leaving.
+    if (ex) { try { clean = await ex.shutdown(ex.halted ?? (failure ? `runner_error:${String((failure as any)?.message ?? failure)}` : 'run_complete')); } catch (e) { journal({ at: Date.now(), type: 'shutdown_error', error: String(e?.message ?? e) }); } }
+    else clean = true;
+    channel?.stop();
+    if (ex) {
+      const eq = ex.equity(marks);
+      ledger.sessions.push({ endedAt: new Date().toISOString(), pnlUsd: round(eq ?? ex.cash), out });
+      mkdirSync(join('tmp', 'mm-live'), { recursive: true });
+      writeFileSync(ledgerPath, JSON.stringify(ledger, null, 1));
+    }
+    closeSync(lockFd);
+    if (clean) unlinkSync(lockPath); else console.error(`shutdown not confirmed clean; ${lockPath} kept`);
+  }
+  if (!ex) throw failure;
   const elapsedDays = Math.max(1e-9, stats.cycles / 86_400);
   const rewardRows = markets.map((m) => { const r = reward.get(m.conditionId) ?? { usd: 0, quotedMs: 0, eligibleMs: 0 }; return { market: m.question.slice(0, 60), dailyPool: m.dailyPool, rewardMinSize: m.rewardMinSize, quotedPct: round(r.quotedMs / 10 / Math.max(1, stats.cycles)), eligiblePct: round(r.eligibleMs / 10 / Math.max(1, stats.cycles)), estRewardUsd: round(r.usd), estRewardUsdPerDay: round(r.usd / elapsedDays) }; });
   const evaluation = { fills: fills.length, filledShares: round(fills.reduce((s, f) => s + f.shares, 0)), markouts: markouts(fills, (t, at) => midAfter(series.get(t) ?? [], at)),
@@ -196,6 +245,7 @@ async function run(markets: Market[]) {
   writeFileSync(join(out, 'summary.json'), JSON.stringify(summary, null, 1));
   console.log(JSON.stringify(summary, null, 1));
   if (!clean) process.exitCode = 1;
+  if (failure) throw failure;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

@@ -21,14 +21,14 @@ export interface DesiredQuote {
   tick: number; tickSize: TickSize; negRisk: boolean;
 }
 export interface ExecLimits {
-  maxOrderShares: number; maxNetSharesPerToken: number; maxMarketUsd: number; maxPortfolioUsd: number;
+  maxOrderShares: number; maxNetSharesPerToken: number; maxMarketUsd: number; maxEventUsd: number; maxPortfolioUsd: number;
   maxOpenOrders: number; maxOrdersPerMinute: number; maxLossUsd: number; restToleranceTicks: number;
   maxConsecutiveRejects: number; maxHeartbeatMisses: number; ackTimeoutMs: number; maxPositionDriftShares: number;
   /** Venue balances settle after a match; skip drift checks on a token this long after its last fill. */
   driftGraceMs: number;
 }
 export const CANARY_LIMITS: ExecLimits = {
-  maxOrderShares: 50, maxNetSharesPerToken: 100, maxMarketUsd: 25, maxPortfolioUsd: 100,
+  maxOrderShares: 50, maxNetSharesPerToken: 100, maxMarketUsd: 25, maxEventUsd: 50, maxPortfolioUsd: 100,
   maxOpenOrders: 20, maxOrdersPerMinute: 60, maxLossUsd: 10, restToleranceTicks: 1,
   maxConsecutiveRejects: 5, maxHeartbeatMisses: 2, ackTimeoutMs: 15_000, maxPositionDriftShares: 0.01,
   driftGraceMs: 120_000,
@@ -36,7 +36,7 @@ export const CANARY_LIMITS: ExecLimits = {
 
 /** $200 canary: reward minimums of 50 shares fit at any price inside a $50 market cap. */
 export const BUDGET_200_LIMITS: ExecLimits = {
-  ...CANARY_LIMITS, maxOrderShares: 100, maxNetSharesPerToken: 200, maxMarketUsd: 50, maxPortfolioUsd: 200, maxLossUsd: 20,
+  ...CANARY_LIMITS, maxOrderShares: 100, maxNetSharesPerToken: 200, maxMarketUsd: 50, maxEventUsd: 100, maxPortfolioUsd: 200, maxLossUsd: 20,
 };
 export const LIMIT_PROFILES: Record<string, ExecLimits> = { '100': CANARY_LIMITS, '200': BUDGET_200_LIMITS };
 
@@ -62,6 +62,9 @@ export class MmLiveExecutor {
   private seq = 0;
   private meta = new Map<string, { conditionId: string; event: string }>();
   private lastFillAt = new Map<string, number>();
+  private lookupMisses = new Map<string, number>();
+  /** Net result of earlier sessions on this wallet (from the loss ledger); losses there use up the loss limit. */
+  priorPnlUsd = 0;
 
   constructor(
     private venue: MmVenue,
@@ -101,7 +104,7 @@ export class MmLiveExecutor {
     if (kill) await this.halt(`kill:${kill}`);
     const eq = this.equity(marks);
     if (eq == null) await this.halt('missing_mark_for_inventory');
-    else if (-eq > this.limits.maxLossUsd) await this.halt(`loss_limit:${(-eq).toFixed(2)}`);
+    else if (-(eq + this.priorPnlUsd) > this.limits.maxLossUsd) await this.halt(`loss_limit:${(-(eq + this.priorPnlUsd)).toFixed(2)}`);
     if (this.halted) return { placed: 0, cancelled: 0 };
 
     const want = new Map<string, DesiredQuote>();
@@ -133,9 +136,11 @@ export class MmLiveExecutor {
       } catch (e) { this.log('cancel_error', { ids, error: String(e?.message ?? e) }); }
     }
 
-    // Place where the slot is empty.
+    // Place where the slot is empty. A halt can land during any awaited venue call
+    // (signal, user-channel fill, heartbeat), so it is rechecked before every submit.
     let placed = 0;
     for (const [key, d] of want) {
+      if (this.halted || this.killRequested()) break;
       if (this.slot(d.tokenId, d.side).length) continue;
       const why = this.preTradeCheck(d);
       if (why) { this.log('skip', { key, reason: why }); continue; }
@@ -153,6 +158,8 @@ export class MmLiveExecutor {
         if (r.ok && r.venueOrderId) {
           o.venueOrderId = r.venueOrderId; o.state = 'open'; this.rejects = 0; placed++;
           this.log('ack', { clientKey, venueOrderId: r.venueOrderId });
+          // Halted while this order was in flight: halt's cancel-all may have run before it rested.
+          if (this.halted) { await this.halt(this.halted); break; }
         } else {
           o.state = 'rejected'; o.error = r.error; this.rejects++;
           this.log('reject', { clientKey, error: r.error });
@@ -164,6 +171,8 @@ export class MmLiveExecutor {
         this.log('ack_unknown', { clientKey, error: o.error });
       }
     }
+    const late = this.killRequested();
+    if (late && !this.halted) await this.halt(`kill:${late}`);
     return { placed, cancelled };
   }
 
@@ -186,6 +195,8 @@ export class MmLiveExecutor {
     const marketHeld = [...this.position].filter(([t]) => this.meta.get(t)?.conditionId === d.conditionId).reduce((s, [, n]) => s + Math.max(0, n), 0);
     // Inventory is valued at 1 per share (worst case) for the capital caps.
     if (marketHeld + bidsOn((o) => o.conditionId === d.conditionId) + cost > L.maxMarketUsd + 1e-9) return 'market_usd_limit';
+    const eventHeld = [...this.position].filter(([t]) => this.meta.get(t)?.event === d.event).reduce((s, [, n]) => s + Math.max(0, n), 0);
+    if (eventHeld + bidsOn((o) => o.event === d.event) + cost > L.maxEventUsd + 1e-9) return 'event_usd_limit';
     const allHeld = [...this.position.values()].reduce((s, n) => s + Math.max(0, n), 0);
     if (allHeld + bidsOn(() => true) + cost > L.maxPortfolioUsd + 1e-9) return 'portfolio_usd_limit';
     return null;
@@ -200,6 +211,8 @@ export class MmLiveExecutor {
     if (f.status === 'failed') {
       if (prev == null) return;
       this.fills.delete(key); o.fillSeen -= prev;
+      // A reconciled size_matched taken before the failure counted this trade too; drop it until the venue reports again.
+      o.venueMatched = Math.max(0, o.venueMatched - prev);
     } else {
       if (prev != null) return; // MATCHED then CONFIRMED for the same trade: count once
       this.fills.set(key, f.shares); o.fillSeen += f.shares;
@@ -254,10 +267,20 @@ export class MmLiveExecutor {
       if (!o.venueOrderId) continue;
       const v = byId.get(o.venueOrderId);
       if (v) { this.venueMatch(o, v.matchedShares); continue; }
-      let final: VenueOrder | null = null;
-      try { final = await this.venue.getOrder(o.venueOrderId); } catch { /* treat as gone */ }
-      if (final) this.venueMatch(o, final.matchedShares);
-      if (LIVE.includes(o.state)) o.state = o.filled >= o.shares - 1e-9 ? 'filled' : 'cancelled';
+      // Missing from the open list is not proof it is gone: close only on a terminal status.
+      let final: VenueOrder | null = null, lookupError: string | null = null;
+      try { final = await this.venue.getOrder(o.venueOrderId); } catch (e) { lookupError = String(e?.message ?? e); }
+      if (!final || final.status === 'open' || final.status === 'unknown') {
+        if (final) this.venueMatch(o, final.matchedShares);
+        const misses = (this.lookupMisses.get(o.clientKey) ?? 0) + 1;
+        this.lookupMisses.set(o.clientKey, misses);
+        this.log('order_unconfirmed', { clientKey: o.clientKey, venueOrderId: o.venueOrderId, misses, status: final?.status ?? null, error: lookupError });
+        if (!final && misses >= 3) { await this.halt(`order_state_unconfirmed:${o.venueOrderId}`); break; }
+        continue;
+      }
+      this.lookupMisses.delete(o.clientKey);
+      this.venueMatch(o, final.matchedShares);
+      if (LIVE.includes(o.state)) o.state = final.status === 'filled' || o.filled >= o.shares - 1e-9 ? 'filled' : 'cancelled';
       this.log('closed', { clientKey: o.clientKey, venueOrderId: o.venueOrderId, state: o.state, filled: o.filled });
     }
 
