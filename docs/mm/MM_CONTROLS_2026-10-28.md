@@ -53,3 +53,18 @@ Tests: `tests/unit/mmMarketStop.test.ts` (12 tests) and `tests/unit/mmLiveWatch.
 
 - Merging YES+NO pairs back to collateral. Held pairs are counted at $1 per share against the caps, which is conservative.
 - A taker exit in the replay is filled at the best bid. A real exit in a fast book can fill worse or only partly.
+
+## Protection rules tested later on 28 Oct
+
+These were added on top of both sides plus the $5 stop, and replayed on 20 Oct and 25–27 Oct. Total net is $30.17 without them.
+
+| Rule | Total | Worst day | Note |
+|---|---|---|---|
+| Pause a side after 2 same-side fills (60 min) | +$30.44 | −$6.79 | No real change; fills are sparse |
+| Pause after 3 | +$30.04 | −$6.78 | Same |
+| Close a position 2 / 3 / 5 cents against entry | +$25.61 / +$25.70 / +$29.56 | about −$7 to −$8 | Pays the spread more often |
+| Close after holding 30 / 60 / 120 min | +$21.11 / +$11.40 / +$25.65 | +$1.83 / −$12.88 / −$4.66 | 30 min saves 27 Oct but costs the rest |
+| Cap at 100 / 50 shares | +$26.88 / +$25.63 | −$5.06 / −$4.27 | Smaller worst day for a little less |
+
+Picking rules on three days and scoring on the fourth gave $16.21, against $30.17 for the plain stop. None is on by default. The 50-share cap is available as `--max-net-shares=50`.
+

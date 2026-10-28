@@ -23,11 +23,13 @@ describe('per-market stop', () => {
     venue.fillOrder(ex.liveOrders().find((o) => o.tokenId === 'Y')!.venueOrderId!, 10);
     // 10 shares bought at 0.40 now mark at 0.10: market C is down $3, past the $2.50 stop.
     const marks = new Map([['Y', 0.1], ['Z', 0.3]]);
+    venue.touch('Y', 0.09, 0.11);
     await ex.step([q({ price: 0.09 }), other], marks, new Map([['Y', 0.09]]));
     expect(ex.stoppedMarkets.has('C')).toBe(true);
     expect(ex.halted).toBeNull();
     const exit = venue.sent.find((r) => r.exit)!;
-    expect(exit).toMatchObject({ tokenId: 'Y', side: 'SELL', price: 0.09, shares: 10 });
+    // Priced one tick under the bid (exitSlippageTicks), filled at the bid.
+    expect(exit).toMatchObject({ tokenId: 'Y', side: 'SELL', price: 0.08, shares: 10, kind: 'ioc' });
     expect(ex.position.get('Y')).toBeCloseTo(0);
     expect(ex.marketPnl('C', marks)).toBeCloseTo(-3.1);
     expect(ex.liveOrders().map((o) => o.tokenId)).toEqual(['Z']);
@@ -60,6 +62,7 @@ describe('per-market stop', () => {
     venue.onFill = (f) => { void ex.onFill(f); };
     await ex.step([q({ shares: 100, price: 0.2 })], new Map([['Y', 0.2]]));
     venue.fillOrder(ex.liveOrders()[0].venueOrderId!, 100);
+    venue.touch('Y', 0.1, 0.12);
     venue.exitFillShares = 60;
     await ex.step([], new Map([['Y', 0.1]]), new Map([['Y', 0.1]]));
     expect(ex.position.get('Y')).toBeCloseTo(40);

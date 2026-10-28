@@ -18,24 +18,34 @@
  *   and once nothing of it rests, held shares leave by fill-and-kill sells at the best bid.
  *   Other markets keep quoting; the portfolio loss limit still halts everything.
  */
-import type { MmVenue, PlaceRequest, Side, TickSize, VenueFill, VenueOrder } from './venue.js';
+import { TAKER_KINDS, type MmVenue, type OrderKind, type PlaceRequest, type Side, type TickSize, type VenueFill, type VenueOrder } from './venue.js';
 
 export interface DesiredQuote {
   tokenId: string; conditionId: string; event: string; side: Side; price: number; shares: number;
   tick: number; tickSize: TickSize; negRisk: boolean;
+  /** Order type (venue.ts); defaults to 'quote' (post-only, rests until cancelled). */
+  kind?: OrderKind;
+  /** 'quote-until' lifetime; the executor renews the order before it lapses. */
+  ttlMs?: number;
 }
+/** Best bid and ask per token, for taker price guards and exits. A bare number is a best bid. */
+export type BookTops = Map<string, number | { bid: number; ask: number }>;
 export interface ExecLimits {
   maxOrderShares: number; maxNetSharesPerToken: number; maxMarketUsd: number; maxEventUsd: number; maxPortfolioUsd: number;
   maxOpenOrders: number; maxOrdersPerMinute: number; maxLossUsd: number; restToleranceTicks: number;
   /** Per-market stop: flatten and stop quoting that market for the session (0 disables). */
   maxMarketLossUsd: number;
+  /** A taker (limit, ioc, fok) may not be priced more than this many ticks through the touch. */
+  maxTakerSlippageTicks: number;
+  /** Exit sells are priced this many ticks under the best bid, so a thin top level does not leave the exit unfilled. */
+  exitSlippageTicks: number;
   maxConsecutiveRejects: number; maxHeartbeatMisses: number; ackTimeoutMs: number; maxPositionDriftShares: number;
   /** Venue balances settle after a match; skip drift checks on a token this long after its last fill. */
   driftGraceMs: number;
 }
 export const CANARY_LIMITS: ExecLimits = {
   maxOrderShares: 50, maxNetSharesPerToken: 100, maxMarketUsd: 25, maxEventUsd: 50, maxPortfolioUsd: 100,
-  maxOpenOrders: 20, maxOrdersPerMinute: 60, maxLossUsd: 10, maxMarketLossUsd: 2.5, restToleranceTicks: 1,
+  maxOpenOrders: 20, maxOrdersPerMinute: 60, maxLossUsd: 10, maxMarketLossUsd: 2.5, maxTakerSlippageTicks: 3, exitSlippageTicks: 1, restToleranceTicks: 1,
   maxConsecutiveRejects: 5, maxHeartbeatMisses: 2, ackTimeoutMs: 15_000, maxPositionDriftShares: 0.01,
   driftGraceMs: 120_000,
 };
@@ -55,7 +65,7 @@ const LIVE: OrderState[] = ['submitting', 'open', 'cancel_pending', 'unknown'];
 export interface TrackedOrder {
   clientKey: string; venueOrderId?: string; tokenId: string; conditionId: string; event: string; side: Side;
   price: number; shares: number; state: OrderState; filled: number; fillSeen: number; venueMatched: number; submittedAt: number; error?: string;
-  exit?: boolean;
+  exit?: boolean; kind?: OrderKind; expiresAt?: number;
 }
 export interface MarketStop { at: number; lossUsd: number }
 export interface JournalRow { at: number; type: string; [k: string]: unknown }
@@ -132,9 +142,11 @@ export class MmLiveExecutor {
 
   /**
    * One control cycle: kill and loss checks, market stops, then move venue orders toward the
-   * desired quotes. `exitPrices` (best bid per token) prices the exit sells of stopped markets.
+   * desired quotes. `tops` (best bid and ask per token) guards taker prices and prices the
+   * exit sells of stopped markets.
    */
-  async step(desired: DesiredQuote[], marks: Map<string, number>, exitPrices: Map<string, number> = new Map()) {
+  async step(desired: DesiredQuote[], marks: Map<string, number>, tops: BookTops = new Map()) {
+    this.tops = tops;
     const kill = this.killRequested();
     if (kill) await this.halt(`kill:${kill}`);
     const eq = this.equity(marks);
@@ -168,7 +180,9 @@ export class MmLiveExecutor {
     for (const o of this.liveOrders()) {
       if (o.state !== 'open') continue;
       const d = want.get(`${o.tokenId}:${o.side}`);
-      const keep = d && Math.abs(d.price - o.price) <= this.limits.restToleranceTicks * d.tick + 1e-9 && d.shares === o.shares;
+      // Same price (within tolerance), size and type; an expiring quote is renewed a minute before it lapses.
+      const keep = d && Math.abs(d.price - o.price) <= this.limits.restToleranceTicks * d.tick + 1e-9 && d.shares === o.shares
+        && (d.kind ?? 'quote') === (o.kind ?? 'quote') && !(o.expiresAt != null && o.expiresAt - this.clock() < 60_000);
       if (!keep) toCancel.push(o);
     }
     let cancelled = 0;
@@ -194,10 +208,13 @@ export class MmLiveExecutor {
         // Shares go out in order-size chunks; whatever is left sells on the next cycle.
         const held = Math.min(this.limits.maxOrderShares, Math.floor((this.position.get(token) ?? 0) * 100 + 1e-6) / 100);
         if (held <= 0 || this.liveOrders().some((o) => o.tokenId === token)) continue;
-        const bid = exitPrices.get(token);
+        const bid = this.top(token)?.bid;
         if (!(bid != null && bid > 0 && bid < 1)) { this.log('skip', { key: `${token}:EXIT`, reason: 'no_bid_for_exit' }); continue; }
         const m = this.meta.get(token)!, last = desired.find((d) => d.tokenId === token);
-        const d: DesiredQuote = { tokenId: token, conditionId: c, event: m.event, side: 'SELL', price: bid, shares: held, tick: last?.tick ?? 0.01, tickSize: last?.tickSize ?? this.tickSizes.get(token) ?? '0.01', negRisk: last?.negRisk ?? this.negRisk.get(token) ?? false };
+        const tick = last?.tick ?? this.ticks.get(token) ?? 0.01;
+        // Fill-and-kill a few ticks under the bid: the venue still fills at the best price available.
+        const worst = Math.max(tick, Math.round((bid - this.limits.exitSlippageTicks * tick) / tick) * tick);
+        const d: DesiredQuote = { tokenId: token, conditionId: c, event: m.event, side: 'SELL', price: +worst.toFixed(6), shares: held, tick, tickSize: last?.tickSize ?? this.tickSizes.get(token) ?? '0.01', negRisk: last?.negRisk ?? this.negRisk.get(token) ?? false, kind: 'ioc' };
         const r = await this.submit(`${token}:EXIT`, d, true);
         if (r === 'stop') break;
         if (r === 'placed') placed++;
@@ -206,7 +223,7 @@ export class MmLiveExecutor {
     for (const [key, d] of want) {
       if (this.halted || this.killRequested()) break;
       if (this.slot(d.tokenId, d.side).length) continue;
-      this.tickSizes.set(d.tokenId, d.tickSize); this.negRisk.set(d.tokenId, d.negRisk);
+      this.tickSizes.set(d.tokenId, d.tickSize); this.negRisk.set(d.tokenId, d.negRisk); this.ticks.set(d.tokenId, d.tick);
       const r = await this.submit(key, d, false);
       if (r === 'stop') break;
       if (r === 'placed') placed++;
@@ -218,6 +235,9 @@ export class MmLiveExecutor {
 
   private tickSizes = new Map<string, DesiredQuote['tickSize']>();
   private negRisk = new Map<string, boolean>();
+  private ticks = new Map<string, number>();
+  private tops: BookTops = new Map();
+  private top(token: string) { const t = this.tops.get(token); return t == null ? null : typeof t === 'number' ? { bid: t, ask: NaN } : t; }
 
   /** Risk check, rate limit, submit and acknowledgement for one order. 'stop' ends the cycle. */
   private async submit(key: string, d: DesiredQuote, exit: boolean): Promise<'placed' | 'skipped' | 'rejected' | 'unknown' | 'stop'> {
@@ -228,9 +248,11 @@ export class MmLiveExecutor {
     if (this.submits.length >= this.limits.maxOrdersPerMinute) { this.log('skip', { key, reason: 'rate_limit' }); return 'stop'; }
     this.submits.push(now);
     const clientKey = `${key}:${now}:${++this.seq}`;
-    const o: TrackedOrder = { clientKey, tokenId: d.tokenId, conditionId: d.conditionId, event: d.event, side: d.side, price: d.price, shares: d.shares, state: 'submitting', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: now, ...(exit ? { exit: true } : {}) };
+    const kind = d.kind ?? 'quote';
+    const expiresAt = kind === 'quote-until' ? now + (d.ttlMs ?? 180_000) : undefined;
+    const o: TrackedOrder = { clientKey, tokenId: d.tokenId, conditionId: d.conditionId, event: d.event, side: d.side, price: d.price, shares: d.shares, state: 'submitting', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: now, kind, ...(expiresAt ? { expiresAt } : {}), ...(exit ? { exit: true } : {}) };
     this.orders.set(clientKey, o);
-    const req: PlaceRequest = { clientKey, tokenId: d.tokenId, side: d.side, price: d.price, shares: d.shares, tickSize: d.tickSize, negRisk: d.negRisk, ...(exit ? { exit: true } : {}) };
+    const req: PlaceRequest = { clientKey, tokenId: d.tokenId, side: d.side, price: d.price, shares: d.shares, tickSize: d.tickSize, negRisk: d.negRisk, kind, ...(expiresAt ? { expiresAt } : {}), ...(exit ? { exit: true } : {}) };
     this.log('submit', { ...req });
     try {
       const r = await this.venue.place(req);
@@ -267,6 +289,14 @@ export class MmLiveExecutor {
     const L = this.limits;
     if (!(d.price > 0 && d.price < 1) || !(d.shares > 0)) return 'invalid_quote';
     if (d.shares > L.maxOrderShares) return 'order_shares_limit';
+    // A taker must name a worst price no further than maxTakerSlippageTicks through the touch.
+    if (TAKER_KINDS.includes(d.kind ?? 'quote')) {
+      const t = this.top(d.tokenId);
+      const ref = d.side === 'BUY' ? t?.ask : t?.bid;
+      if (ref == null || !Number.isFinite(ref)) return 'taker_without_book';
+      const through = d.side === 'BUY' ? d.price - ref : ref - d.price;
+      if (through > L.maxTakerSlippageTicks * d.tick + 1e-9) return 'taker_price_outside_guard';
+    }
     if (this.liveOrders().length >= L.maxOpenOrders) return 'open_orders_limit';
     const live = this.liveOrders();
     const held = this.position.get(d.tokenId) ?? 0;
@@ -311,7 +341,9 @@ export class MmLiveExecutor {
     }
     this.log('fill', { ...f, clientKey: o.clientKey });
     // A taker exit can fill better than its limit; maker quotes fill at their own price.
-    this.setFilled(o, Math.max(o.fillSeen, o.venueMatched), 'stream', o.exit && f.price > 0 && f.price < 1 ? f.price : o.price);
+    // A taker can fill better than its limit; a resting quote fills at its own price.
+    const taker = o.exit || TAKER_KINDS.includes(o.kind ?? 'quote');
+    this.setFilled(o, Math.max(o.fillSeen, o.venueMatched), 'stream', taker && f.price > 0 && f.price < 1 ? f.price : o.price);
   }
 
   private venueMatch(o: TrackedOrder, matched: number) {
@@ -423,7 +455,7 @@ export class MmLiveExecutor {
     for (const r of rows) {
       if (r.type === 'submit') {
         const x = r as any;
-        ex.orders.set(x.clientKey, { clientKey: x.clientKey, tokenId: x.tokenId, conditionId: '', event: '', side: x.side, price: x.price, shares: x.shares, state: 'unknown', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: r.at, ...(x.exit ? { exit: true } : {}) });
+        ex.orders.set(x.clientKey, { clientKey: x.clientKey, tokenId: x.tokenId, conditionId: '', event: '', side: x.side, price: x.price, shares: x.shares, state: 'unknown', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: r.at, ...(x.kind ? { kind: x.kind } : {}), ...(x.expiresAt ? { expiresAt: x.expiresAt } : {}), ...(x.exit ? { exit: true } : {}) });
       } else if (r.type === 'ack') { const o = ex.orders.get(r.clientKey as string); if (o) { o.venueOrderId = r.venueOrderId as string; o.state = 'open'; } }
       else if (r.type === 'reject') { const o = ex.orders.get(r.clientKey as string); if (o) o.state = 'rejected'; }
       else if (r.type === 'adopt') { const o = ex.orders.get(r.clientKey as string); if (o) { o.venueOrderId = r.venueOrderId as string; o.state = 'open'; } }

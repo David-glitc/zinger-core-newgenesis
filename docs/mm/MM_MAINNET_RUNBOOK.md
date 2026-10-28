@@ -85,6 +85,29 @@ A market that loses $5 stops alone for the rest of the UTC day. Its shares are s
 
 After a halt: read the action feed, check the venue for resting orders if shutdown wasn't confirmed clean (the lock file is then kept), clear the kill file, and restart by hand.
 
+## Order types
+
+Every order carries a limit price, so nothing fills worse than the price it was sent with. Types are set per order (`DesiredQuote.kind`) and mapped to the exchange in `clobVenue.ts`.
+
+| Type | What it does | Exchange | Used for |
+|---|---|---|---|
+| `quote` | Rests, never takes; refused if it would cross | GTC post-only | MM quotes (default) |
+| `quote-until` | Same, and expires on its own; renewed a minute before it lapses | GTD post-only | `--quote-type=quote-until --quote-ttl-s=180`: quotes clean themselves up if everything else fails |
+| `limit` | Takes up to its price, rests the rest | GTC | Working an order |
+| `ioc` | Takes up to its price, cancels the rest | FAK | "Market" orders with a worst price; market-stop exits |
+| `fok` | All at its price or better, or nothing | FOK | All-or-nothing |
+
+Guards on anything that takes liquidity:
+- It is refused if priced more than `maxTakerSlippageTicks` (3) through the best price, or if there is no book to compare against.
+- Exits are fill-and-kill sells priced `exitSlippageTicks` (1) under the best bid, and fill at the best price available.
+- A taker fill is booked at the price it actually got.
+
+`--max-net-shares=50` lowers the inventory cap below the profile's 200. In the replay that cut the worst day from −$6.76 to −$4.27, for about $4.50 less over four days.
+
+## Proxies and region
+
+The gate refuses to arm when a proxy or relay is configured, and it checks the region from the machine that actually sends the orders. That is deliberate: a proxy that changes where orders appear to come from would get around Polymarket's regional restriction, and the runner won't trade that way. Live has to be run by an eligible operator, from an eligible location, with direct egress.
+
 ## 6. Limits at `--budget=200`
 
 | Limit | Value |

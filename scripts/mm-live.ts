@@ -9,6 +9,10 @@
  * has no open orders and holds none of the quoted tokens (a dedicated, flat wallet).
  * Stop: Ctrl-C, SIGTERM or create the kill file. Every path cancels all orders first.
  *
+ * --quote-type=quote (default; GTC post-only) or quote-until (GTD post-only, renewed before it
+ * lapses; --quote-ttl-s, default 180) sets how quotes rest. Exits are fill-and-kill sells with a
+ * worst price exitSlippageTicks under the bid; see OrderKind in src/research/mm/live/venue.ts.
+ *
  * --sides=both (default) bids YES and NO, the two sides Polymarket's reward scores together
  * (a NO bid counts as a YES ask). --sides=yes bids YES only, as before.
  * A market whose result passes -maxMarketLossUsd stops for the rest of the UTC day, across
@@ -25,7 +29,7 @@ import { POLY } from '../src/polymarket/config.js';
 
 const [cmd = 'run', ...rest] = process.argv.slice(2);
 const args = Object.fromEntries(rest.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : 'true']; }));
-const allowed = ['markets', 'universe', 'mode', 'minutes', 'out', 'auth', 'evidence', 'kill-file', 'offset-ticks', 'max-markets', 'budget', 'sides'];
+const allowed = ['markets', 'universe', 'mode', 'minutes', 'out', 'auth', 'evidence', 'kill-file', 'offset-ticks', 'max-markets', 'budget', 'sides', 'quote-type', 'quote-ttl-s', 'max-net-shares'];
 if (!['preflight', 'run'].includes(cmd) || Object.keys(args).some((k) => !allowed.includes(k))) {
   console.error(`usage: mm-live.ts preflight|run --markets=<ids> [--${allowed.slice(1).join(' --')}]`); process.exit(2);
 }
@@ -34,9 +38,20 @@ if (!['dry-run', 'live'].includes(mode)) throw Error('mode must be dry-run or li
 const killFile = args['kill-file'] ?? 'tmp/mm-live.KILL';
 if (!LIMIT_PROFILES[args.budget ?? '100']) throw Error(`--budget must be one of ${Object.keys(LIMIT_PROFILES).join(', ')}`);
 const limits: ExecLimits = { ...LIMIT_PROFILES[args.budget ?? '100'] };
+// Optional tighter inventory cap. In the 28 Oct replay, 50 shares cut the worst day from -$6.76
+// to -$4.27 for about $4.50 less over four days. It can only lower the profile's cap.
+if (args['max-net-shares'] != null) {
+  const n = Number(args['max-net-shares']);
+  if (!(n > 0 && n <= limits.maxNetSharesPerToken)) throw Error(`--max-net-shares must be above 0 and at most ${limits.maxNetSharesPerToken}`);
+  limits.maxNetSharesPerToken = n;
+}
 const offsetTicks = Number(args['offset-ticks'] ?? 1);
 const sides = (args.sides ?? 'both') as 'both' | 'yes';
 if (!['both', 'yes'].includes(sides)) throw Error('--sides must be both or yes');
+const quoteType = (args['quote-type'] ?? 'quote') as 'quote' | 'quote-until';
+if (!['quote', 'quote-until'].includes(quoteType)) throw Error('--quote-type must be quote or quote-until');
+const quoteTtlMs = Number(args['quote-ttl-s'] ?? 180) * 1000;
+if (quoteType === 'quote-until' && !(quoteTtlMs >= 120_000)) throw Error('--quote-ttl-s must be at least 120 (the exchange adds a one-minute threshold)');
 const CLOB = 'https://clob.polymarket.com';
 
 async function get(url: string, init?: RequestInit) {
@@ -85,7 +100,7 @@ async function liveClient() {
   const trade: any = await import('../src/polymarket/trade.js');
   const client = await trade.getTradingClient();
   const creds = await trade.ensureApiKey();
-  return { client, creds, enums: { buy: sdk.Side.BUY, sell: sdk.Side.SELL, gtc: sdk.OrderType.GTC, conditional: sdk.AssetType.CONDITIONAL, fak: sdk.OrderType.FAK }, trade };
+  return { client, creds, enums: { buy: sdk.Side.BUY, sell: sdk.Side.SELL, gtc: sdk.OrderType.GTC, conditional: sdk.AssetType.CONDITIONAL, fak: sdk.OrderType.FAK, fok: sdk.OrderType.FOK, gtd: sdk.OrderType.GTD }, trade };
 }
 
 async function preflight(markets: Market[]) {
@@ -172,7 +187,7 @@ async function run(markets: Market[]) {
   }
   ex.priorPnlUsd = priorPnlUsd;
   for (const [c, st] of Object.entries(priorStops)) ex.stoppedMarkets.set(c, st);
-  writeFileSync(join(out, 'config.json'), JSON.stringify({ mode, sides, limits, limitsHash: limitsHash(limits), offsetTicks, priorStops, markets }, null, 1));
+  writeFileSync(join(out, 'config.json'), JSON.stringify({ mode, sides, quoteType, quoteTtlMs: quoteType === 'quote-until' ? quoteTtlMs : null, limits, limitsHash: limitsHash(limits), offsetTicks, priorStops, markets }, null, 1));
 
   const cfg: MmConfig = { ...DEFAULT_MM_CONFIG, maxAgeMs: 5000, maxSpread: 0.2, quoteLifetimeMs: 10_000, feeReserveLegs: 1, quoteOffsetTicks: offsetTicks,
     maxNetShares: limits.maxNetSharesPerToken, maxMarketUsd: limits.maxMarketUsd, maxEventUsd: limits.maxEventUsd, maxPortfolioUsd: limits.maxPortfolioUsd };
@@ -191,7 +206,7 @@ async function run(markets: Market[]) {
     const elapsedDays = Math.max(1e-9, stats.cycles / 86_400);
     const eq = x.equity(marks);
     const status = {
-      at: Date.now(), pid: process.pid, mode, sides, budget: args.budget ?? '100', limitsHash: limitsHash(limits), startedAt, endsAt: endAt, killFile,
+      at: Date.now(), pid: process.pid, mode, sides, quoteType, budget: args.budget ?? '100', limitsHash: limitsHash(limits), startedAt, endsAt: endAt, killFile,
       running: !final, halted: x.halted, cycles: stats.cycles, bookErrors: stats.bookErrors, placed: stats.placed, cancelled: stats.cancelled, reasons: stats.reasons,
       cashUsd: round(x.cash), equityUsd: eq == null ? null : round(eq), priorPnlUsd: round(priorPnlUsd),
       lossRoomUsd: eq == null ? null : round(limits.maxLossUsd + priorPnlUsd + eq), maxLossUsd: limits.maxLossUsd, maxMarketLossUsd: limits.maxMarketLossUsd, maxPortfolioUsd: limits.maxPortfolioUsd,
@@ -203,7 +218,7 @@ async function run(markets: Market[]) {
         return { conditionId: m.conditionId, question: m.question, yesMid: marks.get(m.yes) ?? null, noMid: marks.get(m.no) ?? null,
           yesShares: round(x.position.get(m.yes) ?? 0), noShares: round(x.position.get(m.no) ?? 0), pnlUsd: pnl == null ? null : round(pnl),
           stopped: x.stoppedMarkets.get(m.conditionId) ?? null, estRewardUsdPerDay: round(r.usd / elapsedDays), quotedPct: round(r.quotedMs / 10 / Math.max(1, stats.cycles)),
-          orders: x.liveOrders().filter((o) => o.tokenId === m.yes || o.tokenId === m.no).map((o) => ({ outcome: o.tokenId === m.yes ? 'YES' : 'NO', side: o.side, price: o.price, shares: o.shares, filled: round(o.filled), state: o.state, exit: !!o.exit })) };
+          orders: x.liveOrders().filter((o) => o.tokenId === m.yes || o.tokenId === m.no).map((o) => ({ outcome: o.tokenId === m.yes ? 'YES' : 'NO', side: o.side, price: o.price, shares: o.shares, filled: round(o.filled), state: o.state, exit: !!o.exit, kind: o.kind ?? 'quote', expiresAt: o.expiresAt ?? null })) };
       }),
       ...final,
     };
@@ -228,7 +243,7 @@ async function run(markets: Market[]) {
       continue;
     }
     const desired: DesiredQuote[] = [];
-    const exitPrices = new Map<string, number>();
+    const tops = new Map<string, { bid: number; ask: number }>();
     for (const m of markets) {
       const top = new Map<string, { bid: number; ask: number }>();
       for (const token of [m.yes, m.no]) {
@@ -237,7 +252,7 @@ async function run(markets: Market[]) {
         const bid = Math.max(...b.bids.map((l) => l.price)), ask = Math.min(...b.asks.map((l) => l.price)), mid = (bid + ask) / 2;
         top.set(token, { bid, ask });
         marks.set(token, mid);
-        exitPrices.set(token, bid);
+        tops.set(token, { bid, ask });
         if (!series.has(token)) series.set(token, []);
         series.get(token)!.push({ at: b.receivedAt, mid });
         const h = (history.get(token) ?? []).filter((p) => p.at > t0 - 60_000); h.push({ at: b.receivedAt, mid }); history.set(token, h);
@@ -271,10 +286,10 @@ async function run(markets: Market[]) {
           cashAvailableUsd: Math.max(0, limits.maxPortfolioUsd + ex.cash), ownedShares: Math.max(0, held), netOutcomeShares: net,
           marketCommittedUsd: 0, eventCommittedUsd: 0, portfolioCommittedUsd: 0 }, { ...cfg, maxOrderShares: shares }, 'touch');
         stats.reasons[plan.reason] = (stats.reasons[plan.reason] ?? 0) + 1;
-        for (const q of plan.quotes) desired.push({ tokenId: token, conditionId: m.conditionId, event: m.event, side: q.side, price: q.price, shares: q.shares, tick: m.tick, tickSize: m.tickSize, negRisk: m.negRisk });
+        for (const q of plan.quotes) desired.push({ tokenId: token, conditionId: m.conditionId, event: m.event, side: q.side, price: q.price, shares: q.shares, tick: m.tick, tickSize: m.tickSize, negRisk: m.negRisk, kind: quoteType, ...(quoteType === 'quote-until' ? { ttlMs: quoteTtlMs } : {}) });
       }
     }
-    const r = await ex.step(desired, marks, exitPrices);
+    const r = await ex.step(desired, marks, tops);
     stats.placed += r.placed; stats.cancelled += r.cancelled; stats.cycles++;
     await service();
     try { writeStatus(); } catch (e) { journal({ at: Date.now(), type: 'status_error', error: String(e?.message ?? e) }); }
