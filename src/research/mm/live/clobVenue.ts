@@ -11,6 +11,7 @@ import type { MmVenue, PlaceRequest, PlaceResult, Side, VenueOrder } from './ven
 
 export interface ClobLike {
   createAndPostOrder(order: { tokenID: string; price: number; size: number; side: any }, options: { tickSize: any; negRisk?: boolean }, orderType?: any, postOnly?: boolean): Promise<any>;
+  createAndPostMarketOrder?(order: { tokenID: string; price: number; amount: number; side: any; orderType?: any }, options: { tickSize: any; negRisk?: boolean }, orderType?: any): Promise<any>;
   cancelOrders(ids: string[]): Promise<any>;
   cancelAll(): Promise<any>;
   getOpenOrders(params?: { market?: string; asset_id?: string }): Promise<any>;
@@ -20,7 +21,7 @@ export interface ClobLike {
 }
 
 /** SDK enum values, injected so this file does not import the SDK at load time. */
-export interface ClobEnums { buy: any; sell: any; gtc: any; conditional: any }
+export interface ClobEnums { buy: any; sell: any; gtc: any; conditional: any; fak?: any }
 
 const errorOf = (r: any): string | null => {
   if (r == null) return 'empty_response';
@@ -55,6 +56,7 @@ export class ClobVenue implements MmVenue {
   constructor(private client: ClobLike, private enums: ClobEnums, private tokens: () => string[], private log: (msg: string, data?: unknown) => void = () => {}) {}
 
   async place(r: PlaceRequest): Promise<PlaceResult> {
+    if (r.exit) return this.exit(r);
     const res = await this.client.createAndPostOrder(
       { tokenID: r.tokenId, price: r.price, size: r.shares, side: r.side === 'BUY' ? this.enums.buy : this.enums.sell },
       { tickSize: r.tickSize, negRisk: r.negRisk },
@@ -66,6 +68,21 @@ export class ClobVenue implements MmVenue {
     if (!res.orderID) return { ok: false, error: 'no_order_id' };
     // A post-only order that matched on arrival would be a venue bug; surface it to reconciliation.
     if (String(res.status ?? '').toLowerCase() === 'matched') this.log('post_only_matched_on_arrival', res);
+    return { ok: true, venueOrderId: res.orderID };
+  }
+
+  /** Market-stop exit: a fill-and-kill sell of held shares, never below `price`. Only sells are allowed. */
+  private async exit(r: PlaceRequest): Promise<PlaceResult> {
+    if (r.side !== 'SELL') return { ok: false, error: 'exit_must_sell' };
+    if (!this.client.createAndPostMarketOrder || this.enums.fak == null) return { ok: false, error: 'exit_unsupported' };
+    const res = await this.client.createAndPostMarketOrder(
+      { tokenID: r.tokenId, price: r.price, amount: r.shares, side: this.enums.sell, orderType: this.enums.fak },
+      { tickSize: r.tickSize, negRisk: r.negRisk },
+      this.enums.fak,
+    );
+    const err = errorOf(res);
+    if (err) return { ok: false, error: err };
+    if (!res.orderID) return { ok: false, error: 'no_order_id' };
     return { ok: true, venueOrderId: res.orderID };
   }
 

@@ -7,7 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import type { ExecLimits } from './executor.js';
 
 /** Hard ceiling for a first funded canary. Raising it is a code change, reviewed like one. */
-export const CANARY_CEILING = { maxPortfolioUsd: 200, maxMarketUsd: 50, maxEventUsd: 100, maxOrderShares: 100, maxLossUsd: 20, maxOpenOrders: 20 };
+export const CANARY_CEILING = { maxPortfolioUsd: 200, maxMarketUsd: 50, maxEventUsd: 100, maxOrderShares: 100, maxLossUsd: 20, maxMarketLossUsd: 5, maxOpenOrders: 20 };
 export const CLOB_HOST = 'https://clob.polymarket.com';
 /** Anything that would route orders somewhere other than the egress the region check ran from. */
 export const RELAY_VARS = ['CLOB_PROXY_URL', 'CLOB_PROXY_API_URL', 'PROXY_URL', 'PROXY', 'HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy', 'ALL_PROXY', 'all_proxy'];
@@ -52,6 +52,7 @@ export function evaluateGate(x: GateInput): { armed: boolean; checks: GateCheck[
     { id: 'live_flag', ok: x.env.ZINGER_MM_LIVE === '1', detail: 'ZINGER_MM_LIVE=1 must be set for this process' },
     { id: 'limits_ack', ok: x.env.ZINGER_MM_LIVE_ACK === hash, detail: `ZINGER_MM_LIVE_ACK must equal ${hash} (hash of the exact limits being armed)` },
     { id: 'canary_ceiling', ok: over.length === 0, detail: over.length ? `limits above canary ceiling: ${over.join(', ')}` : 'limits within canary ceiling' },
+    { id: 'market_stop', ok: L.maxMarketLossUsd > 0, detail: L.maxMarketLossUsd > 0 ? `each market stops and exits at -$${L.maxMarketLossUsd}` : 'maxMarketLossUsd must be above 0: live needs the per-market stop' },
     { id: 'kill_file', ok: !existsSync(x.killFile), detail: `kill file ${x.killFile} must be absent` },
     { id: 'clob_host', ok: host === CLOB_HOST, detail: host === CLOB_HOST ? `orders go to ${CLOB_HOST}` : `CLOB_API_URL=${host} is not ${CLOB_HOST}; credentials and orders would go to an unchecked host` },
     { id: 'no_proxy', ok: proxyVars.length === 0, detail: proxyVars.length ? `proxy/relay configured (${proxyVars.join(', ')}); region must be checked from the real order egress` : 'direct egress' },

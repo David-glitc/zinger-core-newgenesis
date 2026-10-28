@@ -13,6 +13,10 @@
  * - Any unexplained state (orphan venue order, unknown order fill, position drift,
  *   repeated rejects, missed heartbeats, loss limit, kill file) halts: cancel all, stop
  *   quoting, and stay halted until a person restarts the process.
+ * - Market stop: when one market's result (its cash plus marked inventory) falls below
+ *   -maxMarketLossUsd, that market alone stops for the session. Its quotes are cancelled,
+ *   and once nothing of it rests, held shares leave by fill-and-kill sells at the best bid.
+ *   Other markets keep quoting; the portfolio loss limit still halts everything.
  */
 import type { MmVenue, PlaceRequest, Side, TickSize, VenueFill, VenueOrder } from './venue.js';
 
@@ -23,20 +27,26 @@ export interface DesiredQuote {
 export interface ExecLimits {
   maxOrderShares: number; maxNetSharesPerToken: number; maxMarketUsd: number; maxEventUsd: number; maxPortfolioUsd: number;
   maxOpenOrders: number; maxOrdersPerMinute: number; maxLossUsd: number; restToleranceTicks: number;
+  /** Per-market stop: flatten and stop quoting that market for the session (0 disables). */
+  maxMarketLossUsd: number;
   maxConsecutiveRejects: number; maxHeartbeatMisses: number; ackTimeoutMs: number; maxPositionDriftShares: number;
   /** Venue balances settle after a match; skip drift checks on a token this long after its last fill. */
   driftGraceMs: number;
 }
 export const CANARY_LIMITS: ExecLimits = {
   maxOrderShares: 50, maxNetSharesPerToken: 100, maxMarketUsd: 25, maxEventUsd: 50, maxPortfolioUsd: 100,
-  maxOpenOrders: 20, maxOrdersPerMinute: 60, maxLossUsd: 10, restToleranceTicks: 1,
+  maxOpenOrders: 20, maxOrdersPerMinute: 60, maxLossUsd: 10, maxMarketLossUsd: 2.5, restToleranceTicks: 1,
   maxConsecutiveRejects: 5, maxHeartbeatMisses: 2, ackTimeoutMs: 15_000, maxPositionDriftShares: 0.01,
   driftGraceMs: 120_000,
 };
 
-/** $200 canary: reward minimums of 50 shares fit at any price inside a $50 market cap. */
+/**
+ * $200 canary: reward minimums of 50 shares fit at any price inside a $50 market cap.
+ * The $5 market stop is the one control that held up in the 2026-10-28 replay of five
+ * recorded days (it cut the Likud jump from -$63.51 to -$5.44).
+ */
 export const BUDGET_200_LIMITS: ExecLimits = {
-  ...CANARY_LIMITS, maxOrderShares: 100, maxNetSharesPerToken: 200, maxMarketUsd: 50, maxEventUsd: 100, maxPortfolioUsd: 200, maxLossUsd: 20,
+  ...CANARY_LIMITS, maxOrderShares: 100, maxNetSharesPerToken: 200, maxMarketUsd: 50, maxEventUsd: 100, maxPortfolioUsd: 200, maxLossUsd: 20, maxMarketLossUsd: 5,
 };
 export const LIMIT_PROFILES: Record<string, ExecLimits> = { '100': CANARY_LIMITS, '200': BUDGET_200_LIMITS };
 
@@ -45,7 +55,9 @@ const LIVE: OrderState[] = ['submitting', 'open', 'cancel_pending', 'unknown'];
 export interface TrackedOrder {
   clientKey: string; venueOrderId?: string; tokenId: string; conditionId: string; event: string; side: Side;
   price: number; shares: number; state: OrderState; filled: number; fillSeen: number; venueMatched: number; submittedAt: number; error?: string;
+  exit?: boolean;
 }
+export interface MarketStop { at: number; lossUsd: number }
 export interface JournalRow { at: number; type: string; [k: string]: unknown }
 
 const r0 = (x: number) => Math.round(x * 1e6) / 1e6;
@@ -65,6 +77,12 @@ export class MmLiveExecutor {
   private lookupMisses = new Map<string, number>();
   /** Net result of earlier sessions on this wallet (from the loss ledger); losses there use up the loss limit. */
   priorPnlUsd = 0;
+  /** Markets stopped this session, by conditionId. The runner preloads stops from earlier today. */
+  readonly stoppedMarkets = new Map<string, MarketStop>();
+  /** Cash flow per market, so a market's result is its cash plus its marked inventory. */
+  private marketCash = new Map<string, number>();
+  /** Fills that arrived before their order's acknowledgement (an exit can fill on arrival). */
+  private earlyFills: VenueFill[] = [];
 
   constructor(
     private venue: MmVenue,
@@ -91,6 +109,20 @@ export class MmLiveExecutor {
     return v;
   }
 
+  /** One market's cash plus marked inventory. Null if a held token has no mark. */
+  marketPnl(conditionId: string, marks: Map<string, number>) {
+    let v = this.marketCash.get(conditionId) ?? 0;
+    for (const [token, shares] of this.position) {
+      if (this.meta.get(token)?.conditionId !== conditionId || Math.abs(shares) < 1e-9) continue;
+      const m = marks.get(token);
+      if (m == null) return null;
+      v += shares * m;
+    }
+    return v;
+  }
+
+  private tokensOf(conditionId: string) { return [...this.meta].filter(([, m]) => m.conditionId === conditionId).map(([t]) => t); }
+
   async halt(reason: string) {
     if (!this.halted) { this.halted = reason; this.log('halt', { reason }); }
     try { await this.venue.cancelAll(); this.log('cancel_all', { ok: true }); }
@@ -98,8 +130,11 @@ export class MmLiveExecutor {
     for (const o of this.liveOrders()) if (o.state === 'open' || o.state === 'submitting') o.state = 'cancel_pending';
   }
 
-  /** One control cycle: kill checks, then move venue orders toward the desired quotes. */
-  async step(desired: DesiredQuote[], marks: Map<string, number>) {
+  /**
+   * One control cycle: kill and loss checks, market stops, then move venue orders toward the
+   * desired quotes. `exitPrices` (best bid per token) prices the exit sells of stopped markets.
+   */
+  async step(desired: DesiredQuote[], marks: Map<string, number>, exitPrices: Map<string, number> = new Map()) {
     const kill = this.killRequested();
     if (kill) await this.halt(`kill:${kill}`);
     const eq = this.equity(marks);
@@ -111,8 +146,21 @@ export class MmLiveExecutor {
     for (const d of desired) {
       const key = `${d.tokenId}:${d.side}`;
       if (want.has(key)) { await this.halt(`duplicate_desired_quote:${key}`); return { placed: 0, cancelled: 0 }; }
-      want.set(key, d);
       this.meta.set(d.tokenId, { conditionId: d.conditionId, event: d.event });
+      if (!this.stoppedMarkets.has(d.conditionId)) want.set(key, d);
+    }
+
+    // Market stops, checked on every market we have traded or quoted.
+    if (this.limits.maxMarketLossUsd > 0) {
+      const markets = new Set([...this.marketCash.keys(), ...[...this.meta.values()].map((m) => m.conditionId)]);
+      for (const c of markets) {
+        if (this.stoppedMarkets.has(c)) continue;
+        const pnl = this.marketPnl(c, marks);
+        if (pnl == null || -pnl <= this.limits.maxMarketLossUsd) continue;
+        this.stoppedMarkets.set(c, { at: this.clock(), lossUsd: -pnl });
+        this.log('market_stop', { conditionId: c, lossUsd: -pnl, positions: Object.fromEntries(this.tokensOf(c).map((t) => [t, this.position.get(t) ?? 0])) });
+        for (const [k, d] of want) if (d.conditionId === c) want.delete(k);
+      }
     }
 
     // Cancel what is no longer wanted or has moved outside tolerance.
@@ -139,41 +187,79 @@ export class MmLiveExecutor {
     // Place where the slot is empty. A halt can land during any awaited venue call
     // (signal, user-channel fill, heartbeat), so it is rechecked before every submit.
     let placed = 0;
+    // Exits first: a stopped market's held shares, once nothing of that token rests.
+    for (const c of this.stoppedMarkets.keys()) {
+      for (const token of this.tokensOf(c)) {
+        if (this.halted || this.killRequested()) break;
+        // Shares go out in order-size chunks; whatever is left sells on the next cycle.
+        const held = Math.min(this.limits.maxOrderShares, Math.floor((this.position.get(token) ?? 0) * 100 + 1e-6) / 100);
+        if (held <= 0 || this.liveOrders().some((o) => o.tokenId === token)) continue;
+        const bid = exitPrices.get(token);
+        if (!(bid != null && bid > 0 && bid < 1)) { this.log('skip', { key: `${token}:EXIT`, reason: 'no_bid_for_exit' }); continue; }
+        const m = this.meta.get(token)!, last = desired.find((d) => d.tokenId === token);
+        const d: DesiredQuote = { tokenId: token, conditionId: c, event: m.event, side: 'SELL', price: bid, shares: held, tick: last?.tick ?? 0.01, tickSize: last?.tickSize ?? this.tickSizes.get(token) ?? '0.01', negRisk: last?.negRisk ?? this.negRisk.get(token) ?? false };
+        const r = await this.submit(`${token}:EXIT`, d, true);
+        if (r === 'stop') break;
+        if (r === 'placed') placed++;
+      }
+    }
     for (const [key, d] of want) {
       if (this.halted || this.killRequested()) break;
       if (this.slot(d.tokenId, d.side).length) continue;
-      const why = this.preTradeCheck(d);
-      if (why) { this.log('skip', { key, reason: why }); continue; }
-      const now = this.clock();
-      this.submits = this.submits.filter((t) => now - t < 60_000);
-      if (this.submits.length >= this.limits.maxOrdersPerMinute) { this.log('skip', { key, reason: 'rate_limit' }); break; }
-      this.submits.push(now);
-      const clientKey = `${key}:${now}:${++this.seq}`;
-      const o: TrackedOrder = { clientKey, tokenId: d.tokenId, conditionId: d.conditionId, event: d.event, side: d.side, price: d.price, shares: d.shares, state: 'submitting', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: now };
-      this.orders.set(clientKey, o);
-      const req: PlaceRequest = { clientKey, tokenId: d.tokenId, side: d.side, price: d.price, shares: d.shares, tickSize: d.tickSize, negRisk: d.negRisk };
-      this.log('submit', { ...req });
-      try {
-        const r = await this.venue.place(req);
-        if (r.ok && r.venueOrderId) {
-          o.venueOrderId = r.venueOrderId; o.state = 'open'; this.rejects = 0; placed++;
-          this.log('ack', { clientKey, venueOrderId: r.venueOrderId });
-          // Halted while this order was in flight: halt's cancel-all may have run before it rested.
-          if (this.halted) { await this.halt(this.halted); break; }
-        } else {
-          o.state = 'rejected'; o.error = r.error; this.rejects++;
-          this.log('reject', { clientKey, error: r.error });
-          if (this.rejects >= this.limits.maxConsecutiveRejects) { await this.halt(`consecutive_rejects:${r.error}`); break; }
-        }
-      } catch (e) {
-        // The order may or may not be live. Never resubmit blind: reconciliation resolves it.
-        o.state = 'unknown'; o.error = String(e?.message ?? e);
-        this.log('ack_unknown', { clientKey, error: o.error });
-      }
+      this.tickSizes.set(d.tokenId, d.tickSize); this.negRisk.set(d.tokenId, d.negRisk);
+      const r = await this.submit(key, d, false);
+      if (r === 'stop') break;
+      if (r === 'placed') placed++;
     }
     const late = this.killRequested();
     if (late && !this.halted) await this.halt(`kill:${late}`);
     return { placed, cancelled };
+  }
+
+  private tickSizes = new Map<string, DesiredQuote['tickSize']>();
+  private negRisk = new Map<string, boolean>();
+
+  /** Risk check, rate limit, submit and acknowledgement for one order. 'stop' ends the cycle. */
+  private async submit(key: string, d: DesiredQuote, exit: boolean): Promise<'placed' | 'skipped' | 'rejected' | 'unknown' | 'stop'> {
+    const why = this.preTradeCheck(d);
+    if (why) { this.log('skip', { key, reason: why }); return 'skipped'; }
+    const now = this.clock();
+    this.submits = this.submits.filter((t) => now - t < 60_000);
+    if (this.submits.length >= this.limits.maxOrdersPerMinute) { this.log('skip', { key, reason: 'rate_limit' }); return 'stop'; }
+    this.submits.push(now);
+    const clientKey = `${key}:${now}:${++this.seq}`;
+    const o: TrackedOrder = { clientKey, tokenId: d.tokenId, conditionId: d.conditionId, event: d.event, side: d.side, price: d.price, shares: d.shares, state: 'submitting', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: now, ...(exit ? { exit: true } : {}) };
+    this.orders.set(clientKey, o);
+    const req: PlaceRequest = { clientKey, tokenId: d.tokenId, side: d.side, price: d.price, shares: d.shares, tickSize: d.tickSize, negRisk: d.negRisk, ...(exit ? { exit: true } : {}) };
+    this.log('submit', { ...req });
+    try {
+      const r = await this.venue.place(req);
+      if (r.ok && r.venueOrderId) {
+        o.venueOrderId = r.venueOrderId; this.rejects = 0;
+        if (o.state === 'submitting') o.state = 'open';
+        this.log('ack', { clientKey, venueOrderId: r.venueOrderId });
+        await this.replayEarlyFills(o);
+        // Halted while this order was in flight: halt's cancel-all may have run before it rested.
+        if (this.halted) { await this.halt(this.halted); return 'stop'; }
+        return 'placed';
+      }
+      o.state = 'rejected'; o.error = r.error; this.rejects++;
+      this.log('reject', { clientKey, error: r.error });
+      if (this.rejects >= this.limits.maxConsecutiveRejects) { await this.halt(`consecutive_rejects:${r.error}`); return 'stop'; }
+      return 'rejected';
+    } catch (e) {
+      // The order may or may not be live. Never resubmit blind: reconciliation resolves it.
+      o.state = 'unknown'; o.error = String(e?.message ?? e);
+      this.log('ack_unknown', { clientKey, error: o.error });
+      return 'unknown';
+    }
+  }
+
+  private async replayEarlyFills(o: TrackedOrder) {
+    const mine = this.earlyFills.filter((f) => f.venueOrderId === o.venueOrderId);
+    if (!mine.length) return;
+    this.earlyFills = this.earlyFills.filter((f) => f.venueOrderId !== o.venueOrderId);
+    for (const f of mine) await this.onFill(f);
   }
 
   /** Worst case if every open bid (and this one) fills. Null means OK. */
@@ -205,7 +291,13 @@ export class MmLiveExecutor {
   /** Apply a venue fill. Unknown order ids halt: some exposure is not ours to explain. */
   async onFill(f: VenueFill) {
     const o = [...this.orders.values()].find((x) => x.venueOrderId === f.venueOrderId);
-    if (!o) { this.log('fill_unknown_order', { ...f }); await this.halt(`fill_for_unknown_order:${f.venueOrderId}`); return; }
+    if (!o) {
+      // An order still awaiting its ack on this token and side may own it: hold the fill until the ack.
+      if (this.liveOrders().some((x) => x.state === 'submitting' && !x.venueOrderId && x.tokenId === f.tokenId && x.side === f.side)) {
+        this.earlyFills.push(f); this.log('fill_before_ack', { ...f }); return;
+      }
+      this.log('fill_unknown_order', { ...f }); await this.halt(`fill_for_unknown_order:${f.venueOrderId}`); return;
+    }
     const key = `${f.tradeId}:${f.venueOrderId}`;
     const prev = this.fills.get(key);
     if (f.status === 'failed') {
@@ -218,7 +310,8 @@ export class MmLiveExecutor {
       this.fills.set(key, f.shares); o.fillSeen += f.shares;
     }
     this.log('fill', { ...f, clientKey: o.clientKey });
-    this.setFilled(o, Math.max(o.fillSeen, o.venueMatched), 'stream');
+    // A taker exit can fill better than its limit; maker quotes fill at their own price.
+    this.setFilled(o, Math.max(o.fillSeen, o.venueMatched), 'stream', o.exit && f.price > 0 && f.price < 1 ? f.price : o.price);
   }
 
   private venueMatch(o: TrackedOrder, matched: number) {
@@ -227,7 +320,8 @@ export class MmLiveExecutor {
     this.setFilled(o, Math.max(o.fillSeen, o.venueMatched), 'reconcile');
   }
 
-  private setFilled(o: TrackedOrder, filled: number, source: string) {
+  /** `price` defaults to the order's limit, the worst case for a reconciled exit whose fill price is unknown. */
+  private setFilled(o: TrackedOrder, filled: number, source: string, price = o.price) {
     const next = Math.min(o.shares, Math.max(0, filled));
     const delta = next - o.filled;
     if (Math.abs(delta) < 1e-9) return;
@@ -235,9 +329,11 @@ export class MmLiveExecutor {
     this.lastFillAt.set(o.tokenId, this.clock());
     const sign = o.side === 'BUY' ? 1 : -1;
     this.position.set(o.tokenId, (this.position.get(o.tokenId) ?? 0) + sign * delta);
-    this.cash -= sign * delta * o.price;
+    this.cash -= sign * delta * price;
+    const market = o.conditionId || this.meta.get(o.tokenId)?.conditionId || '';
+    this.marketCash.set(market, (this.marketCash.get(market) ?? 0) - sign * delta * price);
     if (o.filled >= o.shares - 1e-9 && LIVE.includes(o.state)) o.state = 'filled';
-    this.log('position', { clientKey: o.clientKey, source, delta: sign * delta, token: o.tokenId, position: this.position.get(o.tokenId), cash: this.cash });
+    this.log('position', { clientKey: o.clientKey, source, delta: sign * delta, price, token: o.tokenId, conditionId: market, position: this.position.get(o.tokenId), cash: this.cash, marketCash: this.marketCash.get(market) });
   }
 
   /**
@@ -327,7 +423,7 @@ export class MmLiveExecutor {
     for (const r of rows) {
       if (r.type === 'submit') {
         const x = r as any;
-        ex.orders.set(x.clientKey, { clientKey: x.clientKey, tokenId: x.tokenId, conditionId: '', event: '', side: x.side, price: x.price, shares: x.shares, state: 'unknown', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: r.at });
+        ex.orders.set(x.clientKey, { clientKey: x.clientKey, tokenId: x.tokenId, conditionId: '', event: '', side: x.side, price: x.price, shares: x.shares, state: 'unknown', filled: 0, fillSeen: 0, venueMatched: 0, submittedAt: r.at, ...(x.exit ? { exit: true } : {}) });
       } else if (r.type === 'ack') { const o = ex.orders.get(r.clientKey as string); if (o) { o.venueOrderId = r.venueOrderId as string; o.state = 'open'; } }
       else if (r.type === 'reject') { const o = ex.orders.get(r.clientKey as string); if (o) o.state = 'rejected'; }
       else if (r.type === 'adopt') { const o = ex.orders.get(r.clientKey as string); if (o) { o.venueOrderId = r.venueOrderId as string; o.state = 'open'; } }
@@ -340,6 +436,12 @@ export class MmLiveExecutor {
         if (o) o.filled += o.side === 'BUY' ? delta : -delta;
         ex.position.set(r.token as string, r.position as number);
         ex.cash = r.cash as number;
+        if (typeof r.conditionId === 'string') {
+          ex.marketCash.set(r.conditionId, r.marketCash as number);
+          if (r.conditionId) ex.meta.set(r.token as string, { conditionId: r.conditionId, event: ex.meta.get(r.token as string)?.event ?? '' });
+        }
+      } else if (r.type === 'market_stop') {
+        ex.stoppedMarkets.set(r.conditionId as string, { at: r.at, lossUsd: r.lossUsd as number });
       } else if (r.type === 'cancel') {
         for (const id of (r.cancelled as string[]) ?? []) { const o = [...ex.orders.values()].find((x) => x.venueOrderId === id); if (o) o.state = 'cancelled'; }
       }

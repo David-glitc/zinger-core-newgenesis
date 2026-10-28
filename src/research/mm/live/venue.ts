@@ -8,6 +8,8 @@ export type TickSize = '0.1' | '0.01' | '0.005' | '0.0025' | '0.001' | '0.0001';
 export interface PlaceRequest {
   clientKey: string; tokenId: string; side: Side; price: number; shares: number;
   tickSize: TickSize; negRisk: boolean;
+  /** Exit sell after a market stop: fill-and-kill taker order, `price` is the worst accepted. */
+  exit?: boolean;
 }
 export interface PlaceResult { ok: boolean; venueOrderId?: string; error?: string }
 export interface VenueOrder {
@@ -50,6 +52,8 @@ export class DryRunVenue implements MmVenue {
   /** Accept the order but throw before returning, as a lost acknowledgement would. */
   loseNextAck = false;
   heartbeatOk = true;
+  /** Cap on how much of an exit order fills (tests of a thin book). Null fills it all. */
+  exitFillShares: number | null = null;
   onFill: (fill: VenueFill) => void = () => {};
 
   constructor(private clock: () => number = Date.now) {}
@@ -61,6 +65,8 @@ export class DryRunVenue implements MmVenue {
     const id = `dry-${++this.seq}`;
     this.orders.set(id, { id, tokenId: r.tokenId, side: r.side, price: r.price, originalShares: r.shares, matchedShares: 0, status: 'open', createdAt: this.clock() });
     if (this.loseNextAck) { this.loseNextAck = false; throw new Error('network: connection reset after send'); }
+    // Fill-and-kill: in dry-run the exit fills in full at its limit (the best bid it was priced at).
+    if (r.exit) { const fill = Math.min(r.shares, this.exitFillShares ?? r.shares); if (fill > 0) this.fillOrder(id, fill); const o = this.orders.get(id)!; if (o.status === 'open') o.status = 'cancelled'; }
     return { ok: true, venueOrderId: id };
   }
 

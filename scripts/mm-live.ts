@@ -2,24 +2,30 @@
  * MM execution runner.
  *
  *   npx tsx scripts/mm-live.ts preflight --markets=<conditionId,...> [--auth] [--evidence=file.json]
- *   npx tsx scripts/mm-live.ts run --markets=<conditionId,...> [--mode=dry-run|live] [--minutes=10]
+ *   npx tsx scripts/mm-live.ts run --markets=<conditionId,...> [--mode=dry-run|live] [--minutes=10] [--sides=both|yes]
  *
  * dry-run (default): public books, in-memory venue, nothing is signed or sent.
  * live: refused unless every gate check in src/research/mm/live/gate.ts passes, the account
  * has no open orders and holds none of the quoted tokens (a dedicated, flat wallet).
  * Stop: Ctrl-C, SIGTERM or create the kill file. Every path cancels all orders first.
+ *
+ * --sides=both (default) bids YES and NO, the two sides Polymarket's reward scores together
+ * (a NO bid counts as a YES ask). --sides=yes bids YES only, as before.
+ * A market whose result passes -maxMarketLossUsd stops for the rest of the UTC day, across
+ * restarts (tmp/mm-live/market-stops-<mode>.json), and its shares are sold at the best bid.
  */
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { planMmQuote, DEFAULT_MM_CONFIG, type MmConfig, type MidObservation } from '../src/research/mm/strategy.js';
 import { LIMIT_PROFILES, MmLiveExecutor, type DesiredQuote, type ExecLimits, type JournalRow } from '../src/research/mm/live/executor.js';
 import { DryRunVenue, type MmVenue, type TickSize } from '../src/research/mm/live/venue.js';
-import { markouts, midAfter, rewardShare, type FillMark } from '../src/research/mm/live/evaluation.js';
+import { marketRewardShare, markouts, midAfter, type FillMark } from '../src/research/mm/live/evaluation.js';
 import { checkGeoblock, evaluateGate, killSwitch, limitsHash, readEvidence } from '../src/research/mm/live/gate.js';
+import { POLY } from '../src/polymarket/config.js';
 
 const [cmd = 'run', ...rest] = process.argv.slice(2);
 const args = Object.fromEntries(rest.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : 'true']; }));
-const allowed = ['markets', 'universe', 'mode', 'minutes', 'out', 'auth', 'evidence', 'kill-file', 'offset-ticks', 'max-markets', 'budget'];
+const allowed = ['markets', 'universe', 'mode', 'minutes', 'out', 'auth', 'evidence', 'kill-file', 'offset-ticks', 'max-markets', 'budget', 'sides'];
 if (!['preflight', 'run'].includes(cmd) || Object.keys(args).some((k) => !allowed.includes(k))) {
   console.error(`usage: mm-live.ts preflight|run --markets=<ids> [--${allowed.slice(1).join(' --')}]`); process.exit(2);
 }
@@ -29,6 +35,8 @@ const killFile = args['kill-file'] ?? 'tmp/mm-live.KILL';
 if (!LIMIT_PROFILES[args.budget ?? '100']) throw Error(`--budget must be one of ${Object.keys(LIMIT_PROFILES).join(', ')}`);
 const limits: ExecLimits = { ...LIMIT_PROFILES[args.budget ?? '100'] };
 const offsetTicks = Number(args['offset-ticks'] ?? 1);
+const sides = (args.sides ?? 'both') as 'both' | 'yes';
+if (!['both', 'yes'].includes(sides)) throw Error('--sides must be both or yes');
 const CLOB = 'https://clob.polymarket.com';
 
 async function get(url: string, init?: RequestInit) {
@@ -77,7 +85,7 @@ async function liveClient() {
   const trade: any = await import('../src/polymarket/trade.js');
   const client = await trade.getTradingClient();
   const creds = await trade.ensureApiKey();
-  return { client, creds, enums: { buy: sdk.Side.BUY, sell: sdk.Side.SELL, gtc: sdk.OrderType.GTC, conditional: sdk.AssetType.CONDITIONAL }, trade };
+  return { client, creds, enums: { buy: sdk.Side.BUY, sell: sdk.Side.SELL, gtc: sdk.OrderType.GTC, conditional: sdk.AssetType.CONDITIONAL, fak: sdk.OrderType.FAK }, trade };
 }
 
 async function preflight(markets: Market[]) {
@@ -100,7 +108,9 @@ async function preflight(markets: Market[]) {
       flat: balanceErrors.length === 0 && Object.values(held).every((v) => v === 0), noOpenOrders: Array.isArray(open) && open.length === 0 };
   }
   const gate = evaluateGate({ mode: 'live', limits, env: process.env, geoblock, collateralUsd, evidence: readEvidence(args.evidence), killFile });
-  return { limitsHash: limitsHash(limits), limits, gate, account, markets: markets.map((m) => ({ id: m.conditionId, q: m.question, tick: m.tick, minShares: m.minShares, rewardMinSize: m.rewardMinSize, negRisk: m.negRisk })) };
+  // Polymarket runs on Polygon mainnet (chain 137) only; a different chain id means a misconfigured client.
+  const network = { chainId: POLY.chainId, mainnet: POLY.chainId === 137, clobHost: process.env.CLOB_API_URL?.trim() || CLOB };
+  return { limitsHash: limitsHash(limits), limits, network, gate, account, markets: markets.map((m) => ({ id: m.conditionId, q: m.question, tick: m.tick, minShares: m.minShares, rewardMinSize: m.rewardMinSize, negRisk: m.negRisk })) };
 }
 
 async function run(markets: Market[]) {
@@ -121,6 +131,11 @@ async function run(markets: Market[]) {
   const ledger: { sessions: { endedAt: string; pnlUsd: number; out: string }[] } = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, 'utf8')) : { sessions: [] };
   const priorPnlUsd = ledger.sessions.reduce((t, x) => t + x.pnlUsd, 0);
   if (limits.maxLossUsd + priorPnlUsd <= 0) { closeSync(lockFd); unlinkSync(lockPath); throw Error(`loss ledger ${ledgerPath}: earlier sessions lost $${(-priorPnlUsd).toFixed(2)}, the full $${limits.maxLossUsd} limit`); }
+  // Market stops last the UTC day, so a restart does not resume a market that was stopped out.
+  const stopsPath = join('tmp', 'mm-live', `market-stops-${mode}.json`);
+  const today = new Date().toISOString().slice(0, 10);
+  const stopsFile: { date: string; markets: Record<string, { at: number; lossUsd: number }> } = existsSync(stopsPath) ? JSON.parse(readFileSync(stopsPath, 'utf8')) : { date: today, markets: {} };
+  const priorStops = stopsFile.date === today ? stopsFile.markets : {};
 
   const fills: FillMark[] = [];
   const series = new Map<string, { at: number; mid: number }[]>();
@@ -130,6 +145,8 @@ async function run(markets: Market[]) {
   const stats = { cycles: 0, bookErrors: 0, placed: 0, cancelled: 0, reasons: {} as Record<string, number> };
   const marks = new Map<string, number>();
   const reward = new Map<string, { usd: number; quotedMs: number; eligibleMs: number }>();
+  // Live status for the Command Center (/api/mm), rewritten atomically every cycle.
+  let writeStatus: (final?: Record<string, unknown>) => void = () => {};
   try {
   const quotedTokens = markets.flatMap((m) => [m.yes, m.no]);
   if (mode === 'live') {
@@ -154,7 +171,8 @@ async function run(markets: Market[]) {
     dry.onFill = (f) => { fills.push({ side: f.side, price: f.price, shares: f.shares, at: f.at, token: f.tokenId }); void sim.onFill(f); };
   }
   ex.priorPnlUsd = priorPnlUsd;
-  writeFileSync(join(out, 'config.json'), JSON.stringify({ mode, limits, limitsHash: limitsHash(limits), offsetTicks, markets }, null, 1));
+  for (const [c, st] of Object.entries(priorStops)) ex.stoppedMarkets.set(c, st);
+  writeFileSync(join(out, 'config.json'), JSON.stringify({ mode, sides, limits, limitsHash: limitsHash(limits), offsetTicks, priorStops, markets }, null, 1));
 
   const cfg: MmConfig = { ...DEFAULT_MM_CONFIG, maxAgeMs: 5000, maxSpread: 0.2, quoteLifetimeMs: 10_000, feeReserveLegs: 1, quoteOffsetTicks: offsetTicks,
     maxNetShares: limits.maxNetSharesPerToken, maxMarketUsd: limits.maxMarketUsd, maxEventUsd: limits.maxEventUsd, maxPortfolioUsd: limits.maxPortfolioUsd };
@@ -168,6 +186,32 @@ async function run(markets: Market[]) {
     if (mode === 'live' && Date.now() - lastHeartbeat > 5000) { await x.heartbeat(); lastHeartbeat = Date.now(); }
   };
   console.log(`mm-live ${mode}: ${markets.length} markets, journal ${journalPath}`);
+  const startedAt = Date.now();
+  writeStatus = (final) => {
+    const elapsedDays = Math.max(1e-9, stats.cycles / 86_400);
+    const eq = x.equity(marks);
+    const status = {
+      at: Date.now(), pid: process.pid, mode, sides, budget: args.budget ?? '100', limitsHash: limitsHash(limits), startedAt, endsAt: endAt, killFile,
+      running: !final, halted: x.halted, cycles: stats.cycles, bookErrors: stats.bookErrors, placed: stats.placed, cancelled: stats.cancelled, reasons: stats.reasons,
+      cashUsd: round(x.cash), equityUsd: eq == null ? null : round(eq), priorPnlUsd: round(priorPnlUsd),
+      lossRoomUsd: eq == null ? null : round(limits.maxLossUsd + priorPnlUsd + eq), maxLossUsd: limits.maxLossUsd, maxMarketLossUsd: limits.maxMarketLossUsd, maxPortfolioUsd: limits.maxPortfolioUsd,
+      fills: fills.length,
+      estRewardUsdPerDay: 0,
+      markets: markets.map((m) => {
+        const r = reward.get(m.conditionId) ?? { usd: 0, quotedMs: 0, eligibleMs: 0 };
+        const pnl = x.marketPnl(m.conditionId, marks);
+        return { conditionId: m.conditionId, question: m.question, yesMid: marks.get(m.yes) ?? null, noMid: marks.get(m.no) ?? null,
+          yesShares: round(x.position.get(m.yes) ?? 0), noShares: round(x.position.get(m.no) ?? 0), pnlUsd: pnl == null ? null : round(pnl),
+          stopped: x.stoppedMarkets.get(m.conditionId) ?? null, estRewardUsdPerDay: round(r.usd / elapsedDays), quotedPct: round(r.quotedMs / 10 / Math.max(1, stats.cycles)),
+          orders: x.liveOrders().filter((o) => o.tokenId === m.yes || o.tokenId === m.no).map((o) => ({ outcome: o.tokenId === m.yes ? 'YES' : 'NO', side: o.side, price: o.price, shares: o.shares, filled: round(o.filled), state: o.state, exit: !!o.exit })) };
+      }),
+      ...final,
+    };
+    status.estRewardUsdPerDay = round(status.markets.reduce((t, m) => t + m.estRewardUsdPerDay, 0));
+    const tmpPath = join(out, 'status.json.tmp');
+    writeFileSync(tmpPath, JSON.stringify(status));
+    renameSync(tmpPath, join(out, 'status.json'));
+  };
 
   while (!ex.halted && Date.now() < endAt) {
     const t0 = Date.now();
@@ -184,39 +228,56 @@ async function run(markets: Market[]) {
       continue;
     }
     const desired: DesiredQuote[] = [];
+    const exitPrices = new Map<string, number>();
     for (const m of markets) {
+      const top = new Map<string, { bid: number; ask: number }>();
       for (const token of [m.yes, m.no]) {
         const b = bk.get(token);
         if (!b?.bids.length || !b.asks.length) { marks.delete(token); continue; }
-        const mid = (Math.max(...b.bids.map((l) => l.price)) + Math.min(...b.asks.map((l) => l.price))) / 2;
+        const bid = Math.max(...b.bids.map((l) => l.price)), ask = Math.min(...b.asks.map((l) => l.price)), mid = (bid + ask) / 2;
+        top.set(token, { bid, ask });
         marks.set(token, mid);
+        exitPrices.set(token, bid);
         if (!series.has(token)) series.set(token, []);
         series.get(token)!.push({ at: b.receivedAt, mid });
-        if (token === m.yes) {
-          const r = reward.get(m.conditionId) ?? { usd: 0, quotedMs: 0, eligibleMs: 0 };
-          for (const o of ex.liveOrders().filter((x) => x.tokenId === token && x.state === 'open')) {
-            const share = rewardShare({ side: o.side, price: o.price, shares: o.shares - o.filled }, b, m.rewardMaxSpread, m.rewardMinSize);
-            r.quotedMs += 1000; if (share > 0) r.eligibleMs += 1000;
-            r.usd += share * m.dailyPool / 86_400;
-          }
-          reward.set(m.conditionId, r);
-        }
         const h = (history.get(token) ?? []).filter((p) => p.at > t0 - 60_000); h.push({ at: b.receivedAt, mid }); history.set(token, h);
-        dry?.touch(token, Math.max(...b.bids.map((l) => l.price)), Math.min(...b.asks.map((l) => l.price)));
-        if (token !== m.yes) continue; // one outcome per market; the NO side is the mirror book
+        dry?.touch(token, bid, ask);
+      }
+      // Reward estimate on the YES book: our YES orders as they are, NO orders mirrored (NO bid p = YES ask 1-p).
+      const yb = bk.get(m.yes);
+      if (yb?.bids.length && yb.asks.length) {
+        const r = reward.get(m.conditionId) ?? { usd: 0, quotedMs: 0, eligibleMs: 0 };
+        const ours = ex.liveOrders().filter((o) => o.state === 'open' && (o.tokenId === m.yes || o.tokenId === m.no)).map((o) => o.tokenId === m.yes
+          ? { side: o.side, price: o.price, shares: o.shares - o.filled }
+          : { side: (o.side === 'BUY' ? 'SELL' : 'BUY') as 'BUY' | 'SELL', price: 1 - o.price, shares: o.shares - o.filled });
+        if (ours.length) {
+          const share = marketRewardShare(ours, yb, m.rewardMaxSpread, m.rewardMinSize);
+          r.quotedMs += 1000; if (share > 0) r.eligibleMs += 1000;
+          r.usd += share * m.dailyPool / 86_400;
+        }
+        reward.set(m.conditionId, r);
+      }
+      if (ex.stoppedMarkets.has(m.conditionId)) { stats.reasons.market_stopped = (stats.reasons.market_stopped ?? 0) + 1; continue; }
+      for (const token of sides === 'both' ? [m.yes, m.no] : [m.yes]) {
+        const b = bk.get(token);
+        if (!top.has(token) || !b) continue;
+        const other = token === m.yes ? m.no : m.yes;
         const held = ex.position.get(token) ?? 0;
+        // Net exposure to this outcome: holding the other outcome offsets it (a YES+NO pair redeems for $1).
+        const net = held - (ex.position.get(other) ?? 0);
         const shares = Math.max(m.minShares, m.rewardMinSize || 0);
-        const plan = planMmQuote({ now: Date.now(), receivedAt: b.receivedAt, serverAt: b.serverAt, usable: true, book: { bids: b.bids, asks: b.asks }, history: h,
+        const plan = planMmQuote({ now: Date.now(), receivedAt: b.receivedAt, serverAt: b.serverAt, usable: true, book: { bids: b.bids, asks: b.asks }, history: history.get(token) ?? [],
           tick: m.tick, minShares: m.minShares, fee: m.fee, accepting: true, eventAt: Number.isFinite(m.endAt) ? m.endAt : null, eventTimeRequired: false,
-          cashAvailableUsd: Math.max(0, limits.maxPortfolioUsd + ex.cash), ownedShares: Math.max(0, held), netOutcomeShares: held,
+          cashAvailableUsd: Math.max(0, limits.maxPortfolioUsd + ex.cash), ownedShares: Math.max(0, held), netOutcomeShares: net,
           marketCommittedUsd: 0, eventCommittedUsd: 0, portfolioCommittedUsd: 0 }, { ...cfg, maxOrderShares: shares }, 'touch');
         stats.reasons[plan.reason] = (stats.reasons[plan.reason] ?? 0) + 1;
         for (const q of plan.quotes) desired.push({ tokenId: token, conditionId: m.conditionId, event: m.event, side: q.side, price: q.price, shares: q.shares, tick: m.tick, tickSize: m.tickSize, negRisk: m.negRisk });
       }
     }
-    const r = await ex.step(desired, marks);
+    const r = await ex.step(desired, marks, exitPrices);
     stats.placed += r.placed; stats.cancelled += r.cancelled; stats.cycles++;
     await service();
+    try { writeStatus(); } catch (e) { journal({ at: Date.now(), type: 'status_error', error: String(e?.message ?? e) }); }
     await sleep(Math.max(0, 1000 - (Date.now() - t0)));
   }
 
@@ -231,7 +292,10 @@ async function run(markets: Market[]) {
       ledger.sessions.push({ endedAt: new Date().toISOString(), pnlUsd: round(eq ?? ex.cash), out });
       mkdirSync(join('tmp', 'mm-live'), { recursive: true });
       writeFileSync(ledgerPath, JSON.stringify(ledger, null, 1));
+      const kept = stopsFile.date === today ? stopsFile.markets : {};
+      writeFileSync(stopsPath, JSON.stringify({ date: today, markets: { ...kept, ...Object.fromEntries(ex.stoppedMarkets) } }, null, 1));
     }
+    try { writeStatus({ cleanShutdown: clean, endedAt: Date.now(), failure: failure ? String((failure as any)?.message ?? failure) : null }); } catch { /* status is advisory */ }
     closeSync(lockFd);
     if (clean) unlinkSync(lockPath); else console.error(`shutdown not confirmed clean; ${lockPath} kept`);
   }
@@ -240,7 +304,7 @@ async function run(markets: Market[]) {
   const rewardRows = markets.map((m) => { const r = reward.get(m.conditionId) ?? { usd: 0, quotedMs: 0, eligibleMs: 0 }; return { market: m.question.slice(0, 60), dailyPool: m.dailyPool, rewardMinSize: m.rewardMinSize, quotedPct: round(r.quotedMs / 10 / Math.max(1, stats.cycles)), eligiblePct: round(r.eligibleMs / 10 / Math.max(1, stats.cycles)), estRewardUsd: round(r.usd), estRewardUsdPerDay: round(r.usd / elapsedDays) }; });
   const evaluation = { fills: fills.length, filledShares: round(fills.reduce((s, f) => s + f.shares, 0)), markouts: markouts(fills, (t, at) => midAfter(series.get(t) ?? [], at)),
     estRewardUsdPerDay: round(rewardRows.reduce((s, r) => s + r.estRewardUsdPerDay, 0)), rewardByMarket: rewardRows };
-  const summary = { mode, budget: args.budget ?? '100', halted: ex.halted, cleanShutdown: clean, ...stats, evaluation, positions: Object.fromEntries(ex.position), cash: round(ex.cash),
+  const summary = { mode, sides, budget: args.budget ?? '100', halted: ex.halted, stoppedMarkets: Object.fromEntries(ex.stoppedMarkets), cleanShutdown: clean, ...stats, evaluation, positions: Object.fromEntries(ex.position), cash: round(ex.cash),
     equityUsd: round(ex.equity(marks) ?? NaN), orders: [...ex.orders.values()].reduce((s, o) => ({ ...s, [o.state]: (s[o.state] ?? 0) + 1 }), {} as Record<string, number>) };
   writeFileSync(join(out, 'summary.json'), JSON.stringify(summary, null, 1));
   console.log(JSON.stringify(summary, null, 1));
